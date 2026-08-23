@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#eef2f7">
+  <title>Anima Prompt Workbench</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div><div class="ambient ambient-two"></div>
+  <header class="topbar material">
+    <div class="brand"><span class="brand-mark">A</span><div><strong>Anima Workbench</strong><small>Agent prompt studio</small></div></div>
+    <div class="topbar-center"><span class="workspace-label">PROMPT WORKSPACE</span><span id="statusPill" class="status-pill"><i></i>本地服务在线</span></div>
+    <div class="top-actions"><button id="newPrompt" class="icon-button" title="新建提示词">＋</button><button id="settingsButton" class="icon-button settings-trigger" title="打开设置">⚙</button></div>
+  </header>
+  <main class="app-shell">
+    <aside class="agent-rail material">
+      <div class="rail-head"><div><span class="eyebrow">AGENT</span><h2>创作对话</h2></div><button id="clearConversation" class="small-icon" title="清空对话">⌫</button></div>
+      <div class="agent-select-wrap"><label for="agentSelect">当前 Agent</label><select id="agentSelect"></select><button id="agentSummary" class="summary-link">设置摘要</button></div>
+      <div id="conversation" class="conversation"><div class="empty-state"><span class="empty-icon">✦</span><strong>告诉 Agent 你想画什么</strong><p>支持中文自然语言。生成结果会自动识别 tag，并按 Anima 规范整理。</p></div></div>
+      <form id="agentForm" class="agent-composer"><textarea id="agentMessage" placeholder="例如：一个穿校服的女孩站在蓝天下，柔和光线，半身肖像…" rows="3"></textarea><div class="composer-foot"><span id="agentHint">⌘ Enter 发送</span><button class="send-button" type="submit" title="发送给 Agent">↑</button></div></form>
+    </aside>
+    <section class="candidate-column">
+      <div class="section-heading"><div><span class="eyebrow">CANDIDATES</span><h1>候选提示词</h1><p>选择一组结果导入右侧 Prompt Document。</p></div><div class="heading-actions"><button id="refreshCandidates" class="quiet-button">重新生成</button></div></div>
+      <div id="candidateList" class="candidate-list"><div class="empty-state candidate-empty"><span class="empty-icon">◌</span><strong>等待 Agent 生成</strong><p>每次可以得到多组候选，先比较，再导入。</p></div></div>
+    </section>
+    <aside class="prompt-column material">
+      <div class="prompt-head"><div><span class="eyebrow">PROMPT DOCUMENT</span><input id="promptTitle" class="title-input" value="Untitled Anima prompt"></div><div class="prompt-actions"><button id="clearPrompt" class="quiet-button">清空</button><button id="savePrompt" class="primary-button">保存</button></div></div>
+      <div class="read-only-summary"><button data-setting="ai/defaults"><span>Agent</span><strong id="summaryAgent">Anima Creator</strong></button><button data-setting="catalog/merge"><span>Tag 仓库</span><strong id="summaryCatalog">Anima + 本地快照</strong></button><button data-setting="translation/google"><span>翻译</span><strong id="summaryTranslation">Google Cloud · 未配置</strong></button></div>
+      <div class="prompt-toolbar"><div class="segmented"><button class="segment active" data-mode="chips">标签</button><button class="segment" data-mode="text">文本</button></div><span id="normalizeState" class="normalize-state">Anima 规范待检查</span><button id="normalizePrompt" class="quiet-button">规范化</button></div>
+      <div class="prompt-body"><section class="prompt-block"><div class="block-head"><span><i class="dot positive"></i>Positive</span><button data-copy="positive" class="copy-button">复制</button></div><div id="positiveChips" class="chip-canvas"></div><textarea id="positiveText" class="prompt-text" hidden></textarea></section><section class="prompt-block negative-block"><div class="block-head"><span><i class="dot negative"></i>Negative</span><button data-copy="negative" class="copy-button">复制</button></div><div id="negativeChips" class="chip-canvas"></div><textarea id="negativeText" class="prompt-text" hidden></textarea></section></div>
+      <div class="prompt-footer"><span id="tokenCount">0 tokens</span><span id="unknownCount">0 个未识别</span><button id="favoritePrompt" class="quiet-button">☆ 收藏</button><button id="copyAll" class="primary-button compact">复制全部</button></div>
+    </aside>
+  </main>
+
+  <section id="settingsOverlay" class="settings-overlay" aria-hidden="true">
+    <div class="settings-scrim" data-close-settings></div>
+    <div class="settings-panel material">
+      <header class="settings-top"><div><span class="eyebrow">WORKBENCH SETTINGS</span><h1>设置</h1></div><button id="closeSettings" class="close-button" title="关闭设置">×</button></header>
+      <div class="settings-layout"><nav id="settingsSections" class="settings-sections"></nav><nav id="settingsGroups" class="settings-groups"></nav><section id="settingsContent" class="settings-content"></section></div>
+    </div>
+  </section>
+  <div id="toast" class="toast"></div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
+
