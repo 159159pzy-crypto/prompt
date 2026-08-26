@@ -83,16 +83,10 @@
 
             <div class="composer">
               <label class="sr-only" for="intentInput">画面描述</label>
-              <textarea id="intentInput" placeholder="例如：雨夜的东京街头，一个穿校服的女孩撑伞站在霓虹灯下，电影感构图"></textarea>
+              <textarea id="intentInput" placeholder="例如：生成 5 组服装变体：雨夜的东京街头，一个穿校服的女孩撑伞站在霓虹灯下，电影感构图"></textarea>
               <div class="composer-bottom">
                 <span class="composer-hint">Ctrl / ⌘ + Enter 生成</span>
                 <div class="composer-tools">
-                  <label class="sr-only" for="resultCount">生成结果数量</label>
-                  <select class="result-count" id="resultCount">
-                    <option value="1">1 个结果</option>
-                    <option value="2">2 个结果</option>
-                    <option value="3">3 个结果</option>
-                  </select>
                   <button class="generate" id="generateButton" type="button"><span>生成结果</span><span aria-hidden="true">↗</span></button>
                 </div>
               </div>
@@ -101,7 +95,7 @@
             <div class="run-message" id="runMessage" role="status" hidden></div>
             <div class="result-head">
               <div><h2>生成结果</h2><span class="result-meta" id="resultMeta">等待输入画面描述</span></div>
-              <button class="copy-link copy-all" id="copyAll" type="button" hidden>复制全部英文</button>
+              <div class="result-actions"><label class="sr-only" for="versionSelect">历史版本</label><select class="version-select" id="versionSelect" hidden></select><button class="copy-link copy-all" id="copyAll" type="button" hidden>复制全部英文</button></div>
             </div>
             <div class="result-grid" id="resultGrid">
               <div class="empty-state"><strong>等待生成</strong><span>真实结果会显示在这里。</span></div>
@@ -163,8 +157,8 @@
             <h2>Skills</h2>
             <p class="settings-intro">选择 Agent 生成前应用的本地提示词规则。更改会即时保存。</p>
             <label class="setting-row" for="skillMode">
-              <span><strong>技能注入模式</strong><small>精简模式常驻核心规则，并按场景注入标签库</small></span>
-              <select class="select" id="skillMode"><option value="compact">精简</option><option value="full">完整</option></select>
+              <span><strong>Agent 能力模式</strong><small>Agent 会按需调用只读 Skill 与内置 Prompt 工具</small></span>
+              <select class="select" id="skillMode"><option value="agent">Agent 自主调用</option></select>
             </label>
             <div class="setting-panel dynamic-panel skills-panel" id="skillsRows"><div class="settings-empty">正在载入 Skills…</div></div>
           </section>

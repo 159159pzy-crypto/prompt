@@ -21,9 +21,9 @@ def client_for(tmp_path, monkeypatch):
 
 def test_fresh_schema_contains_only_core_tables(tmp_path, monkeypatch):
     with client_for(tmp_path, monkeypatch) as client:
-        assert client.get("/api/status").json()["schema_version"] == 2
+        assert client.get("/api/status").json()["schema_version"] == 3
         tables = {row[0] for row in db.connect().execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        assert tables == {"schema_meta", "prompt_documents", "prompt_versions", "agent_runs", "providers", "settings"}
+        assert tables == {"schema_meta", "prompt_documents", "prompt_versions", "agent_runs", "agent_events", "providers", "settings"}
 
 
 def test_generate_without_provider_is_explicit_failure(tmp_path, monkeypatch):
@@ -34,6 +34,45 @@ def test_generate_without_provider_is_explicit_failure(tmp_path, monkeypatch):
         assert body["status"] == "failed"
         assert body["variants"] == []
         assert body["error"]["code"] == "provider_unavailable"
+
+
+def test_generate_modify_keeps_conversation_and_versions(tmp_path, monkeypatch):
+    captured = []
+
+    async def fake_generate(body, provider, secret, system_prompt, enabled_skills):
+        captured.append(body)
+        return {
+            "status": "completed",
+            "engine": "fake",
+            "variants": [{"title": "v", "intent": body.intent, "positive_tokens": [{"raw_text": f"token-{index}"} for index in range(16)]}],
+            "error": None,
+            "latency_ms": 1,
+        }
+
+    monkeypatch.setattr("backend.app.generate_agent", fake_generate)
+    monkeypatch.setattr("backend.app._provider_secret", lambda _provider: "test-secret")
+    with client_for(tmp_path, monkeypatch) as client:
+        provider = client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test"}).json()
+        first = client.post("/api/generate", json={"intent": "雨夜东京街头", "provider_id": provider["id"]}).json()
+        second = client.post("/api/generate", json={
+            "intent": "把头发改成银色，其他内容保持不变",
+            "mode": "modify",
+            "conversation_id": first["conversation_id"],
+            "parent_run_id": first["id"],
+            "current_document": {"original_intent": "雨夜东京街头", "variants": first["variants"]},
+            "provider_id": provider["id"],
+        }).json()
+
+        assert first["revision"] == 1
+        assert second["conversation_id"] == first["conversation_id"]
+        assert second["parent_run_id"] == first["id"]
+        assert second["revision"] == 2
+        assert second["mode"] == "modify"
+        assert captured[1].intent == "雨夜东京街头"
+        assert captured[1].current_document["modification_request"] == "把头发改成银色，其他内容保持不变"
+        runs = client.get("/api/agent-runs").json()["items"]
+        assert len(runs) == 2
+        assert {item["conversation_id"] for item in runs} == {first["conversation_id"]}
 
 
 def test_runtime_system_prompt_is_forwarded_to_agent(tmp_path, monkeypatch):
@@ -51,6 +90,26 @@ def test_runtime_system_prompt_is_forwarded_to_agent(tmp_path, monkeypatch):
         assert response.status_code == 200
         assert captured["system_prompt"] == "只生成夜景，并保持结构化 Token。"
         assert captured["enabled_skills"]["anima-tags"] is True
+
+
+def test_semantic_count_is_forwarded_and_relevant_skills_are_selected(tmp_path, monkeypatch):
+    captured = {}
+
+    async def fake_generate(body, provider, secret, system_prompt, enabled_skills):
+        captured["count"] = body.requested_count
+        captured["skills"] = enabled_skills["__selected_skill_ids"]
+        return {"status": "completed", "engine": "fake", "variants": [{"title": str(i)} for i in range(body.requested_count)], "error": None, "latency_ms": 1}
+
+    monkeypatch.setattr("backend.app.generate_agent", fake_generate)
+    monkeypatch.setattr("backend.app._provider_secret", lambda _provider: "test-secret")
+    with client_for(tmp_path, monkeypatch) as client:
+        provider = client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test"}).json()
+        result = client.post("/api/generate", json={"intent": "给我生成5组不同服装", "provider_id": provider["id"]}).json()
+        assert result["status"] == "completed"
+        assert captured["count"] == 5
+        assert len(result["variants"]) == 5
+        assert "clothing-library" in captured["skills"]
+        assert "conflict-check" in captured["skills"]
 
 
 def test_skills_can_be_listed_and_toggled(tmp_path, monkeypatch):
@@ -133,6 +192,12 @@ def test_backend_lint_checks_section_13_6_and_quantity_band():
     assert quantity["band"] == "standard"
     assert quantity["minimum"] == 22
 
+    solo = {"intent": "单人展示", "positive_tokens": [{"raw_text": "solo"}], "negative_tokens": []}
+    solo_issues = validate_document(solo, enforce_quantity=True)
+    solo_quantity = next(issue for issue in solo_issues if issue["code"] == "quantity_out_of_range")
+    assert solo_quantity["band"] == "simple"
+    assert solo_quantity["minimum"] == 16
+
 
 def test_compact_skill_mode_injects_core_and_relevant_library_only():
     compact = instructions({"__mode": "compact", "__intent": "雨夜街头女孩穿制服"})
@@ -141,6 +206,23 @@ def test_compact_skill_mode_injects_core_and_relevant_library_only():
     assert any("Anima-compatible tags" in item for item in compact)
     assert any("服装与状态标签库" in item for item in compact)
     assert not any("特殊主题配方" in item for item in compact)
+
+
+def test_generation_request_parser_supports_chinese_and_english_counts():
+    assert agent.parse_generation_request("给我生成5组服装变体")["requested_count"] == 5
+    assert agent.parse_generation_request("给我生成五组服装变体")["requested_count"] == 5
+    parsed = agent.parse_generation_request("generate 5 prompts for different outfits")
+    assert parsed["requested_count"] == 5
+    assert parsed["explicit_count"] is True
+    assert "clothing-library" in parsed["variation_dimensions"]
+
+
+def test_generation_request_parser_defaults_to_one_and_detects_dedupe():
+    assert agent.parse_generation_request("雨夜女孩")["requested_count"] == 1
+    parsed = agent.parse_generation_request("给我多组不同服装")
+    assert parsed["requested_count"] == 1
+    assert parsed["dedupe_required"] is True
+    assert "clothing-library" in parsed["variation_dimensions"]
 
 
 class FakeResponse:
@@ -317,6 +399,86 @@ def test_invalid_model_fields_are_retried_once_with_feedback(tmp_path, monkeypat
         assert result["variants"][0]["positive_translations"] == ["一个女孩"]
         assert len(fake_client.requests) == 2
         assert "failed validation" in fake_client.requests[-1]["json"]["messages"][-1]["content"]
+
+
+def test_agent_tool_loop_persists_trace_and_exposes_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANIMA_TEST_KEY", "test-only")
+    with client_for(tmp_path, monkeypatch) as client:
+        provider = client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test", "env_name": "ANIMA_TEST_KEY"}).json()
+        final = {"variants": [{"title": "Rain", "positive_tokens": ["1girl", "rain"]}]}
+        class ToolClient:
+            def __init__(self): self.calls = 0; self.requests = []
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return None
+            async def post(self, *_args, **kwargs):
+                self.requests.append(kwargs)
+                self.calls += 1
+                if self.calls == 1:
+                    content = {"choices": [{"message": {"content": "", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "list_skills", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+                else:
+                    content = {"choices": [{"message": {"content": json.dumps(final), "tool_calls": []}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 2, "completion_tokens": 2}}
+                class Response:
+                    def raise_for_status(self): return None
+                    def json(self_nonlocal): return content
+                return Response()
+        fake = ToolClient()
+        monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **_kwargs: fake)
+        result = client.post("/api/generate", json={"intent": "雨夜女孩", "provider_id": provider["id"]}).json()
+        assert result["status"] == "completed"
+        assert result["tool_trace"][1]["tool_name"] == "list_skills"
+        trace = client.get(f"/api/agent-runs/{result['id']}/trace").json()
+        assert [item["event_type"] for item in trace["items"]] == ["model_request", "tool_call", "model_request", "final"]
+        assert "tools" in fake.requests[0]["json"]
+
+
+def test_vague_multi_request_uses_selected_model_for_helper_and_generation(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANIMA_TEST_KEY", "test-only")
+    with client_for(tmp_path, monkeypatch) as client:
+        provider = client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "old-model", "env_name": "ANIMA_TEST_KEY"}).json()
+        class MultiClient:
+            def __init__(self): self.requests = []
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return None
+            async def post(self, *_args, **kwargs):
+                self.requests.append(kwargs)
+                if len(self.requests) == 1:
+                    payload = {"choices": [{"message": {"content": '{"requested_count":2,"explicit_count":false,"variation_dimensions":[],"dedupe_required":true}'}, "finish_reason": "stop"}]}
+                else:
+                    tokens = [f"token-{index}" for index in range(16)]
+                    payload = {"choices": [{"message": {"content": json.dumps({"variants": [{"positive_tokens": tokens}, {"positive_tokens": tokens + ["rain"]}]})}, "finish_reason": "stop"}]}
+                class Response:
+                    def raise_for_status(self): return None
+                    def json(self_nonlocal): return payload
+                return Response()
+        fake = MultiClient()
+        monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **_kwargs: fake)
+        result = client.post("/api/generate", json={"intent": "生成多组不同方案", "provider_id": provider["id"], "model": "new-model"}).json()
+        assert result["status"] == "completed"
+        assert [request["json"]["model"] for request in fake.requests] == ["new-model", "new-model"]
+
+
+def test_unknown_tool_is_returned_to_agent_as_tool_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANIMA_TEST_KEY", "test-only")
+    with client_for(tmp_path, monkeypatch) as client:
+        provider = client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test", "env_name": "ANIMA_TEST_KEY"}).json()
+        class UnknownClient:
+            def __init__(self): self.calls = 0
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return None
+            async def post(self, *_args, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    payload = {"choices": [{"message": {"content": "", "tool_calls": [{"id": "x", "type": "function", "function": {"name": "shell", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}]}
+                else:
+                    payload = {"choices": [{"message": {"content": '{"variants":[{"positive_tokens":["1girl"]}]}', "tool_calls": []}, "finish_reason": "stop"}]}
+                class Response:
+                    def raise_for_status(self): return None
+                    def json(self_nonlocal): return payload
+                return Response()
+        monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **_kwargs: UnknownClient())
+        result = client.post("/api/generate", json={"intent": "测试", "provider_id": provider["id"]}).json()
+        assert result["status"] == "completed"
+        assert result["tool_trace"][1]["status"] == "failed"
 
 
 class FakeModelsResponse:

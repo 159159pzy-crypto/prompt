@@ -80,6 +80,12 @@ def _requested_skill_ids(value: Any) -> set[str]:
     intent = str(value.get("__intent") or "") if isinstance(value, dict) else ""
     lowered = intent.casefold()
     selected = set(CORE_SKILL_IDS)
+    if isinstance(value, dict) and bool(value.get("__dedupe_required")):
+        selected.add("conflict-check")
+        selected.add("slot-order")
+    requested_dimensions = value.get("__variation_dimensions") if isinstance(value, dict) else []
+    if isinstance(requested_dimensions, (list, tuple, set)):
+        selected.update(str(item) for item in requested_dimensions)
     for skill_id, hints in SCENARIO_SKILL_HINTS.items():
         if any(str(hint).casefold() in lowered for hint in hints):
             selected.add(skill_id)
@@ -100,7 +106,7 @@ def selected(value: Any) -> list[dict[str, Any]]:
         requested = _requested_skill_ids(value)
         items = [
             item for item in definitions()
-            if item["id"] in requested and (enabled[item["id"]] or item["id"] in CORE_SKILL_IDS)
+            if item["id"] in requested and (enabled[item["id"]] or item["id"] in CORE_SKILL_IDS or item["id"] in requested)
         ]
     else:
         items = [

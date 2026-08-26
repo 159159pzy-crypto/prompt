@@ -8,23 +8,24 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from .banlist import BANLIST, FORBIDDEN_SECTION_13_6
 from .db import connect, now, row_json
 from .prompt import classify, parse_prompt, serialize_prompt
 
 PROTECTED_RE = re.compile(r"^(?:<lora:[^>]+>|<embed:[^>]+>|BREAK)$", re.I)
 
-# These are workflow-provided effects and must never be emitted as prompt tags.
-FORBIDDEN_SECTION_13_6 = frozenset({
-    "sunlight", "moonlight", "dim light", "candlelight", "neon light", "neon lights", "streetlights",
-    "backlighting", "rim light", "warm lighting", "cool lighting", "golden hour glow", "soft lighting",
-    "warm tone", "cool tone", "sepia", "blue tone", "amber tone", "god rays", "light rays",
-    "light particles", "volumetric light beams", "tyndall effect", "glowing", "illuminated", "lit",
-    "backlit", "spotlight", "flash",
-})
 
 def _count_band(document: dict[str, Any]) -> tuple[str, int, int] | None:
-    """Infer the template count band only when the prompt declares a multi-person scene."""
-    names = {str(item.get("raw_text", "")).strip().casefold() for item in document.get("positive_tokens", [])}
+    """Infer the template quantity band from count tags and the declared intent."""
+    names = {
+        value
+        for item in document.get("positive_tokens", [])
+        for value in (
+            str(item.get("raw_text", "")).strip().casefold(),
+            str(item.get("normalized_tag", "")).strip().casefold(),
+        )
+        if value
+    }
     intent = str(document.get("intent", "")).casefold()
     if {"1girl", "1boy"} <= names or "hetero" in names or "yuri" in names or any(word in intent for word in ("双人", "两人", "前戏", "性交", "体位", "男女", "情侣", "two-person", "foreplay")):
         return "standard", 22, 38
@@ -32,7 +33,12 @@ def _count_band(document: dict[str, Any]) -> tuple[str, int, int] | None:
         return "complex", 30, 48
     if any(word in intent for word in ("多人", "群交", "剧情主视觉", "特殊主题")):
         return "complex", 30, 48
-    return None
+    single_person = (
+        "solo" in names
+        or bool(names & {"1girl", "1boy"})
+        or any(word in intent for word in ("单人", "一个女孩", "一个男孩", "一名女孩", "一名男孩", "single-person", "solo"))
+    )
+    return ("simple", 16, 30) if single_person else None
 
 
 def json_value(value: str | None, fallback: Any) -> Any:
@@ -124,6 +130,12 @@ def validate_document(document: dict[str, Any], *, enforce_quantity: bool = Fals
         raw_text = str(token.get("raw_text", "")).strip().casefold()
         if raw_text in FORBIDDEN_SECTION_13_6:
             issues.append({"code": "forbidden_section_13_6", "side": "negative_tokens", "index": index, "message": f"§13.6 禁令词：{token.get('raw_text', '')}"})
+    for index, token in enumerate(document.get("positive_tokens", [])):
+        raw_text = str(token.get("raw_text", "")).strip().casefold()
+        if raw_text in BANLIST["quality"]:
+            issues.append({"code": "forbidden_quality", "side": "positive_tokens", "index": index, "message": f"质量禁词：{token.get('raw_text', '')}"})
+        if raw_text in BANLIST["generic"]:
+            issues.append({"code": "forbidden_generic", "side": "positive_tokens", "index": index, "message": f"空泛禁词：{token.get('raw_text', '')}"})
     if enforce_quantity:
         band = _count_band(document)
         if band:

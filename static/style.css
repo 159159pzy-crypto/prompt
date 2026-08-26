@@ -151,6 +151,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .result-meta { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; }
 .copy-link { min-height: 32px; padding: 3px 0; border: 0; background: transparent; color: var(--accent-active); font-size: 11px; }
 .copy-link:hover { color: var(--accent-hover); text-decoration: underline; }
+.result-actions { display: flex; align-items: center; gap: 10px; }
+.version-select { max-width: 180px; min-height: 32px; padding: 0 28px 0 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel); color: var(--fg-2); font: inherit; font-size: 12px; }
 .copy-all { flex: 0 0 auto; }
 .result-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .result-card { min-width: 0; padding: 18px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: color-mix(in oklab, var(--bg) 88%, transparent); transition: transform var(--motion-base) var(--ease-standard), box-shadow var(--motion-base) var(--ease-standard); }

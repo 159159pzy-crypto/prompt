@@ -3,15 +3,124 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any
+import asyncio
+import logging
+from typing import Any, Callable
 
 import httpx
 from json_repair import repair_json
 
 from .documents import PROTECTED_RE, canonical_document, validate_document
 from .prompt import split_prompt
-from .skills import instructions as skill_instructions
+from . import skill_runtime
+from .skills import instructions as skill_instructions, selected_ids as selected_skill_ids
 from .persona import STUDIO_PERSONA
+
+logger = logging.getLogger(__name__)
+
+_CN_NUMBERS = {
+    "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+_DIMENSION_HINTS = {
+    "clothing-library": ("服装", "衣服", "制服", "裙", "内衣", "穿着", "outfit", "clothing"),
+    "pose-library": ("姿势", "体位", "动作", "pose", "action"),
+    "camera-scene-library": ("镜头", "构图", "场景", "视角", "camera", "composition", "scene"),
+    "appearance-library": ("外貌", "发色", "眼睛", "身体", "头发", "appearance", "hair", "eyes"),
+    "mood-library": ("氛围", "质感", "色调", "天气", "mood", "atmosphere"),
+}
+
+
+def _chinese_number(value: str) -> int | None:
+    if value.isdigit():
+        return int(value)
+    if value in _CN_NUMBERS:
+        return _CN_NUMBERS[value]
+    if value.endswith("十") and value[:-1] in _CN_NUMBERS:
+        return _CN_NUMBERS[value[:-1]] * 10
+    if value.startswith("十"):
+        return 10 + (_CN_NUMBERS.get(value[1:]) or 0)
+    if "十" in value:
+        left, right = value.split("十", 1)
+        if left in _CN_NUMBERS and (not right or right in _CN_NUMBERS):
+            return _CN_NUMBERS[left] * 10 + (_CN_NUMBERS.get(right) or 0)
+    return None
+
+
+def parse_generation_request(intent: str, fallback_count: int = 1) -> dict[str, Any]:
+    """Extract explicit variant count and semantic dimensions from user text."""
+    text = str(intent or "").strip()
+    explicit_count = False
+    count: int | None = None
+    patterns = (
+        r"(?<![0-9])([0-9]{1,5}|[零一二两三四五六七八九十百]+)\s*(?:组|个|套|份|种|条|prompts?|sets?|variants?)",
+        r"(?:generate|make|give me|create)\s+([0-9]{1,5})\s+(?:prompts?|sets?|variants?)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            parsed = _chinese_number(match.group(1))
+            if parsed and parsed > 0:
+                count = parsed
+                explicit_count = True
+                break
+    dimensions = [skill_id for skill_id, hints in _DIMENSION_HINTS.items() if any(hint.casefold() in text.casefold() for hint in hints)]
+    lowered = text.casefold()
+    dedupe_required = bool((count or fallback_count) > 1 or any(word in lowered for word in ("不重复", "不同", "变体", "variation", "distinct", "unique")))
+    return {
+        "requested_count": count or max(1, int(fallback_count or 1)),
+        "explicit_count": explicit_count,
+        "variation_dimensions": dimensions,
+        "dedupe_required": dedupe_required,
+    }
+
+
+async def _agent_parse_request(intent: str, provider: Any, secret: str, fallback_count: int, model: str = "") -> dict[str, Any] | None:
+    """Ask the provider to resolve vague multi-variant language when local rules cannot."""
+    if not provider or not secret:
+        return None
+    prompt = (
+        "Extract generation intent as JSON only. Return exactly these fields: "
+        "requested_count (positive integer), explicit_count (boolean), "
+        "variation_dimensions (array of skill ids), dedupe_required (boolean). "
+        "If no explicit count is present, use 1. Valid dimensions: clothing-library, "
+        "pose-library, camera-scene-library, appearance-library, mood-library.\nUser: " + intent
+    )
+    request = {
+        # Keep the helper request on the same explicitly selected route as the
+        # main generation request. The provider default may be stale.
+        "model": model or provider["model"],
+        "temperature": 0,
+        "messages": [{"role": "system", "content": "Return JSON only."}, {"role": "user", "content": prompt}],
+        "max_tokens": 256,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=min(float(provider["timeout"] if "timeout" in provider.keys() else 120), 30.0)) as client:
+            response = await client.post(provider["base_url"].rstrip("/") + "/chat/completions", json=request, headers={"Authorization": f"Bearer {secret}"})
+            response.raise_for_status()
+            payload = response.json()
+            content = _message_content(payload.get("choices", [{}])[0].get("message", {}))
+            parsed = _parse_model_json(content)
+            count = int(parsed.get("requested_count") or fallback_count or 1)
+            if count < 1:
+                return None
+            dimensions = [str(item) for item in parsed.get("variation_dimensions", []) if str(item) in _DIMENSION_HINTS]
+            return {"requested_count": count, "explicit_count": bool(parsed.get("explicit_count")), "variation_dimensions": dimensions, "dedupe_required": bool(parsed.get("dedupe_required", count > 1))}
+    except (httpx.HTTPError, KeyError, TypeError, ValueError, IndexError, json.JSONDecodeError):
+        return None
+
+
+def _cross_variant_diagnostics(variants: list[dict[str, Any]], dimensions: list[str]) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    token_sets = [set(str(token.get("raw_text", "")).casefold() for token in item.get("positive_tokens", []) if isinstance(token, dict)) for item in variants]
+    for left in range(len(token_sets)):
+        for right in range(left + 1, len(token_sets)):
+            shared = token_sets[left] & token_sets[right]
+            denominator = max(1, len(token_sets[left] | token_sets[right]))
+            overlap = len(shared) / denominator
+            if overlap >= 0.8:
+                diagnostics.append({"code": "variant_too_similar", "variants": [left + 1, right + 1], "overlap": round(overlap, 3), "dimensions": dimensions})
+    return diagnostics
 
 
 def error(code: str, message: str) -> dict[str, str]:
@@ -130,6 +239,96 @@ def _parse_model_json(content: str) -> dict[str, Any]:
     return parsed
 
 
+MAX_TOOL_RESULT_CHARS = 12000
+MAX_AGENT_ROUNDS = 16
+AGENT_TIMEOUT_SECONDS = 300
+
+
+def _clip(value: Any, limit: int = MAX_TOOL_RESULT_CHARS) -> Any:
+    if isinstance(value, str):
+        return value[:limit]
+    if isinstance(value, list):
+        return [_clip(item, limit) for item in value[:100]]
+    if isinstance(value, dict):
+        return {str(key): _clip(item, limit) for key, item in list(value.items())[:100]}
+    return value
+
+
+def _tool_definitions() -> list[dict[str, Any]]:
+    return [
+        {"type": "function", "function": {"name": "list_skills", "description": "List all available read-only repository Skills.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
+        {"type": "function", "function": {"name": "read_skill", "description": "Read one discovered repository Skill instruction body by id.", "parameters": {"type": "object", "properties": {"skill_id": {"type": "string"}}, "required": ["skill_id"], "additionalProperties": False}}},
+        {"type": "function", "function": {"name": "validate_prompt", "description": "Validate a structured Anima prompt document and return issues.", "parameters": {"type": "object", "properties": {"document": {"type": "object"}, "enforce_quantity": {"type": "boolean"}}, "required": ["document"], "additionalProperties": False}}},
+        {"type": "function", "function": {"name": "normalize_prompt", "description": "Normalize a structured Anima prompt document into canonical Token objects.", "parameters": {"type": "object", "properties": {"document": {"type": "object"}}, "required": ["document"], "additionalProperties": False}}},
+    ]
+
+
+def _tool_list_skills() -> dict[str, Any]:
+    items, diagnostics = skill_runtime.catalog({})
+    return {"items": _clip(items), "diagnostics": _clip(diagnostics)}
+
+
+def _tool_read_skill(arguments: dict[str, Any]) -> dict[str, Any]:
+    skill_id = str(arguments.get("skill_id") or "").strip()
+    if not skill_id:
+        raise ValueError("skill_id is required")
+    discovered, diagnostics = skill_runtime.discover()
+    skill = next((item for item in discovered if item.id == skill_id), None)
+    if skill is None:
+        raise ValueError(f"unknown skill: {skill_id}")
+    return {"id": skill.id, "name": skill.display_name or skill.name, "description": skill.description, "instruction": _clip(skill_runtime.load_instructions(skill))}
+
+
+def _tool_validate_prompt(arguments: dict[str, Any]) -> dict[str, Any]:
+    raw_document = arguments.get("document")
+    if not isinstance(raw_document, dict):
+        raise ValueError("document must be an object")
+    document = canonical_document(raw_document)
+    issues = validate_document(document, enforce_quantity=bool(arguments.get("enforce_quantity", False)))
+    return {"valid": not issues, "issues": _clip(issues), "document": _clip(document)}
+
+
+def _tool_normalize_prompt(arguments: dict[str, Any]) -> dict[str, Any]:
+    raw_document = arguments.get("document")
+    if not isinstance(raw_document, dict):
+        raise ValueError("document must be an object")
+    document = canonical_document(raw_document)
+    return {"document": _clip(document), "protected_tokens": document.get("protected_tokens", [])}
+
+
+def _execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if name == "list_skills":
+        return _tool_list_skills()
+    if name == "read_skill":
+        return _tool_read_skill(arguments)
+    if name == "validate_prompt":
+        return _tool_validate_prompt(arguments)
+    if name == "normalize_prompt":
+        return _tool_normalize_prompt(arguments)
+    raise ValueError(f"unknown tool: {name}")
+
+
+def _tool_call_items(message: Any) -> list[dict[str, Any]]:
+    if not isinstance(message, dict) or not isinstance(message.get("tool_calls"), list):
+        return []
+    items: list[dict[str, Any]] = []
+    for item in message["tool_calls"]:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function") if isinstance(item.get("function"), dict) else {}
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        raw_arguments = function.get("arguments", {})
+        if isinstance(raw_arguments, str):
+            try:
+                raw_arguments = json.loads(raw_arguments or "{}")
+            except json.JSONDecodeError:
+                raw_arguments = {}
+        items.append({"id": str(item.get("id") or f"call_{len(items) + 1}"), "name": name, "arguments": raw_arguments if isinstance(raw_arguments, dict) else {}})
+    return items
+
+
 def validate_variant(raw: dict[str, Any], include_chinese: bool) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("variant must be an object")
@@ -141,7 +340,10 @@ def validate_variant(raw: dict[str, Any], include_chinese: bool) -> dict[str, An
         "protected_tokens": raw.get("protected_tokens") or [],
         "notes": raw.get("notes") or "",
     })
-    issues = validate_document(document)
+    # Final model output always passes through the same deterministic tool semantics.
+    normalized = _tool_normalize_prompt({"document": document})["document"]
+    document = normalized
+    issues = _tool_validate_prompt({"document": document, "enforce_quantity": True})["issues"]
     if issues:
         raise ValueError("; ".join(issue["message"] for issue in issues))
     if include_chinese:
@@ -164,7 +366,7 @@ def validate_variant(raw: dict[str, Any], include_chinese: bool) -> dict[str, An
     return document
 
 
-async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "", enabled_skills: Any = None) -> dict[str, Any]:
+async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "", enabled_skills: Any = None, event_sink: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
     started = time.perf_counter()
     if not provider:
         return {"status": "failed", "engine": "none", "variants": [], "error": error("provider_unavailable", "没有启用的模型供应商，请先在设置中配置。"), "latency_ms": 0}
@@ -192,40 +394,97 @@ async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "
             }
         },
     }
+    fallback_count = len((body.current_document or {}).get("variants", [])) if getattr(body, "mode", "create") == "modify" else 1
+    parse_intent = (body.current_document or {}).get("modification_request", "") if getattr(body, "mode", "create") == "modify" else body.intent
+    parsed_request = parse_generation_request(parse_intent or body.intent, fallback_count=fallback_count)
+    vague_multi = bool(re.search(r"多组|几组|若干组|multiple\s+(?:prompts?|sets?|variants?)|several\s+(?:prompts?|sets?|variants?)", parse_intent or body.intent, flags=re.I))
+    agent_request = await _agent_parse_request(parse_intent or body.intent, provider, secret, fallback_count, body.model) if vague_multi and not parsed_request["explicit_count"] else None
+    if agent_request:
+        if not parsed_request["explicit_count"]:
+            parsed_request["requested_count"] = agent_request["requested_count"]
+            parsed_request["explicit_count"] = agent_request["explicit_count"]
+        parsed_request["variation_dimensions"] = list(dict.fromkeys(parsed_request["variation_dimensions"] + agent_request["variation_dimensions"]))
+        parsed_request["dedupe_required"] = bool(parsed_request["dedupe_required"] or agent_request["dedupe_required"])
+    legacy_count = getattr(body, "requested_count", None)
+    requested_count = parsed_request["requested_count"] if parsed_request["explicit_count"] else int(legacy_count or parsed_request["requested_count"])
+    if getattr(body, "mode", "create") == "modify" and not parsed_request["explicit_count"]:
+        requested_count = fallback_count or 1
+    variation_dimensions = parsed_request["variation_dimensions"]
+    dedupe_required = parsed_request["dedupe_required"]
     custom_prompt = str(system_prompt or "").strip()[:12000]
     system = (custom_prompt + "\n\n" if custom_prompt else STUDIO_PERSONA + "\n\n") + DEFAULT_SYSTEM_PROMPT + "\n"
     if body.include_chinese:
         system += TRANSLATION_RULE + "\n"
-    skill_text = skill_instructions(enabled_skills)
-    if skill_text:
-        system += "\n".join(skill_text) + "\n"
+    skill_state = {**(enabled_skills if isinstance(enabled_skills, dict) else {}), "__mode": "compact", "__intent": body.intent, "__requested_count": requested_count, "__variation_dimensions": variation_dimensions, "__dedupe_required": dedupe_required}
+    actual_skill_ids = selected_skill_ids(skill_state)
+    if enabled_skills:
+        rendered = skill_instructions(skill_state)
+        if rendered:
+            system += "\nApply these selected repository Skills for this request:\n" + "\n\n".join(rendered) + "\n"
+    if dedupe_required:
+        system += "\nThis request requires distinct variants. Vary the requested semantic dimensions and avoid repeating core tags across variants; do not collapse variants into one.\n"
+    system += "\nYou may call read-only tools when useful. Always return final JSON with variants after tool work.\n"
     system += f"Return this shape: {json.dumps(schema, ensure_ascii=False)}"
     selected_model = body.model or provider["model"]
     completion_limit = int(provider["max_tokens"])
     if body.reasoning_effort != "none":
         completion_limit = max(completion_limit, 4096)
+    user_payload = {"intent": body.intent, "current_document": body.current_document, "requested_count": requested_count, "include_chinese": body.include_chinese, "variation_dimensions": variation_dimensions, "dedupe_required": dedupe_required}
+    if getattr(body, "mode", "create") == "modify":
+        system += "\nThis is a modification request. Treat current_document.variants as the complete current conversation output. Apply only the user's modification_request; preserve all unspecified subjects, composition, camera, style, and tokens. Return the full revised variants array, not a diff.\n"
+        user_payload["original_intent"] = body.current_document.get("original_intent", body.intent)
+        user_payload["modification_request"] = body.current_document.get("modification_request", "")
     request = {
         "model": selected_model,
         "temperature": provider["temperature"],
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps({"intent": body.intent, "current_document": body.current_document, "requested_count": body.requested_count, "include_chinese": body.include_chinese}, ensure_ascii=False)},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ],
+        "tools": _tool_definitions(),
+        "tool_choice": "auto",
     }
     token_key = "max_completion_tokens" if selected_model.lower().startswith(("gpt-5", "o1", "o3", "o4")) else "max_tokens"
     request[token_key] = completion_limit
     if body.reasoning_effort != "none":
         request["reasoning_effort"] = body.reasoning_effort
     last_usage: dict[str, Any] = {}
+    messages = request["messages"]
+    trace: list[dict[str, Any]] = []
+    def emit(event: dict[str, Any]) -> None:
+        trace.append(event)
+        if event_sink:
+            event_sink(event)
     try:
-        async with httpx.AsyncClient(timeout=provider["timeout"]) as client:
-            for attempt in range(2):
-                response = await client.post(provider["base_url"].rstrip("/") + "/chat/completions", json=request, headers={"Authorization": f"Bearer {secret}"})
+        async with httpx.AsyncClient(timeout=AGENT_TIMEOUT_SECONDS) as client:
+            deadline = time.perf_counter() + AGENT_TIMEOUT_SECONDS
+            for round_index in range(MAX_AGENT_ROUNDS):
+                if time.perf_counter() >= deadline:
+                    raise ModelResponseError("agent_timeout", "Agent 执行超过 300 秒。")
+                request["messages"] = messages
+                emit({"event_type": "model_request", "round": round_index + 1})
+                remaining = max(0.1, deadline - time.perf_counter())
+                response = await asyncio.wait_for(client.post(provider["base_url"].rstrip("/") + "/chat/completions", json=request, headers={"Authorization": f"Bearer {secret}"}), timeout=remaining)
                 response.raise_for_status()
                 payload = response.json()
                 choice = payload["choices"][0]
                 message = choice["message"]
                 last_usage = payload.get("usage") or {}
+                calls = _tool_call_items(message)
+                if calls:
+                    messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": message.get("tool_calls")})
+                    for call in calls:
+                        started_tool = time.perf_counter()
+                        try:
+                            result = _execute_tool(call["name"], call["arguments"])
+                            tool_payload = {"ok": True, "result": _clip(result)}
+                            event_status = "completed"
+                        except (TypeError, ValueError, KeyError) as exc:
+                            tool_payload = {"ok": False, "error": error("tool_error", str(exc))}
+                            event_status = "failed"
+                        emit({"event_type": "tool_call", "round": round_index + 1, "tool_name": call["name"], "arguments": _clip(call["arguments"], 4000), "result": tool_payload, "status": event_status, "latency_ms": int((time.perf_counter() - started_tool) * 1000)})
+                        messages.append({"role": "tool", "tool_call_id": call["id"], "name": call["name"], "content": json.dumps(tool_payload, ensure_ascii=False)})
+                    continue
                 content = _message_content(message)
                 try:
                     if not content:
@@ -241,25 +500,36 @@ async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "
                     parsed = _parse_model_json(content)
                     if not isinstance(parsed.get("variants"), list):
                         raise ModelResponseError("provider_schema_invalid", "模型返回结果缺少 variants 数组。")
-                    variants = [validate_variant(item, body.include_chinese) for item in parsed["variants"][: body.requested_count]]
+                    raw_variants = parsed["variants"]
+                    if len(raw_variants) < requested_count:
+                        raise ModelResponseError("variant_count_insufficient", f"用户要求 {requested_count} 组，但模型只返回 {len(raw_variants)} 组。")
+                    variants = [validate_variant(item, body.include_chinese) for item in raw_variants[:requested_count]]
                     if not variants:
                         raise ModelResponseError("provider_schema_invalid", "模型没有返回有效候选。")
                 except (ModelResponseError, KeyError, TypeError, ValueError) as exc:
-                    if attempt:
-                        raise
-                    retry_note = "Return one complete corrected JSON object only. Follow the required schema and preserve exact token counts."
-                    request["messages"].extend([
+                    retry_note = f"Return exactly {requested_count} complete variants in one JSON object. Follow the required schema and preserve exact token counts."
+                    messages.extend([
                         {"role": "assistant", "content": content[:12000]},
                         {"role": "user", "content": f"Your response failed validation: {str(exc)[:500]} {retry_note}"},
                     ])
-                    continue
+                    if round_index + 1 < MAX_AGENT_ROUNDS:
+                        continue
+                    raise
                 input_tokens, output_tokens = _usage_tokens(last_usage)
-                return {"status": "completed", "engine": "openai-compatible", "variants": variants, "error": None, "latency_ms": int((time.perf_counter() - started) * 1000), "input_tokens": input_tokens, "output_tokens": output_tokens}
+                emit({"event_type": "final", "round": round_index + 1, "status": "completed"})
+                diagnostics = _cross_variant_diagnostics(variants, variation_dimensions) if requested_count > 1 else []
+                if diagnostics:
+                    logger.warning("cross-variant diagnostics: %s", diagnostics)
+                return {"status": "completed", "engine": "openai-compatible", "variants": variants, "error": None, "latency_ms": int((time.perf_counter() - started) * 1000), "input_tokens": input_tokens, "output_tokens": output_tokens, "tool_trace": trace, "selected_skill_ids": actual_skill_ids, "variant_diagnostics": diagnostics}
+            raise ModelResponseError("agent_loop_limit", f"Agent 超过最大循环轮数 {MAX_AGENT_ROUNDS}。")
     except ModelResponseError as exc:
         run_error = error(exc.code, str(exc))
+    except asyncio.TimeoutError as exc:
+        run_error = error("agent_timeout", "Agent 执行超过 300 秒。")
     except httpx.TimeoutException as exc:
         run_error = error("provider_timeout", str(exc))
     except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
         run_error = error("provider_response_invalid", str(exc))
     input_tokens, output_tokens = _usage_tokens(last_usage)
-    return {"status": "failed", "engine": "openai-compatible", "variants": [], "error": run_error, "latency_ms": int((time.perf_counter() - started) * 1000), "input_tokens": input_tokens, "output_tokens": output_tokens}
+    emit({"event_type": "error", "status": "failed", "error": run_error})
+    return {"status": "failed", "engine": "openai-compatible", "variants": [], "error": run_error, "latency_ms": int((time.perf_counter() - started) * 1000), "input_tokens": input_tokens, "output_tokens": output_tokens, "tool_trace": trace}

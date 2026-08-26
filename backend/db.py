@@ -6,12 +6,10 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .skills import default_enabled
-
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 DB_PATH = DATA / "workbench.sqlite3"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def now() -> str:
@@ -71,6 +69,21 @@ def _create_schema(db: sqlite3.Connection) -> None:
             latency_ms INTEGER,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS agent_events (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            tool_name TEXT NOT NULL DEFAULT '',
+            arguments_json TEXT NOT NULL DEFAULT '{}',
+            result_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT '',
+            latency_ms INTEGER,
+            error_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_events_run ON agent_events(run_id, sequence);
         CREATE TABLE IF NOT EXISTS providers (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -91,6 +104,17 @@ def _create_schema(db: sqlite3.Connection) -> None:
         );
         """
     )
+    run_columns = {row["name"] for row in db.execute("PRAGMA table_info(agent_runs)")}
+    if "conversation_id" not in run_columns:
+        db.execute("ALTER TABLE agent_runs ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''")
+    if "parent_run_id" not in run_columns:
+        db.execute("ALTER TABLE agent_runs ADD COLUMN parent_run_id TEXT NOT NULL DEFAULT ''")
+    if "revision" not in run_columns:
+        db.execute("ALTER TABLE agent_runs ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+    if "mode" not in run_columns:
+        db.execute("ALTER TABLE agent_runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'create'")
+    db.execute("UPDATE agent_runs SET conversation_id=id WHERE conversation_id='' OR conversation_id IS NULL")
+
     columns = {row["name"] for row in db.execute("PRAGMA table_info(providers)")}
     if "models_json" not in columns:
         db.execute("ALTER TABLE providers ADD COLUMN models_json TEXT NOT NULL DEFAULT '[]'")
@@ -111,8 +135,6 @@ def _seed(db: sqlite3.Connection) -> None:
             "provider_id": "",
             "model": "",
             "reasoning_effort": "none",
-            "skill_mode": "compact",
-            "skills": default_enabled(),
         },
     }
     for key, payload in defaults.items():

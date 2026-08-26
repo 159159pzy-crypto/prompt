@@ -13,12 +13,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from .agent import generate as generate_agent
+from .agent import generate as generate_agent, parse_generation_request
 from .db import DB_PATH, SCHEMA_VERSION, connect, init_db, now, row_json
 from .documents import canonical_document, document_view as _document_view, export_document as _export_document, json_value as _json, snapshot as _snapshot, validate_document, write_document as _write_document
 from .secrets import delete_secret, get_secret, put_secret
 from .skill_runtime import strip_explicit_markers
-from .skills import catalog as skill_catalog, discovery_diagnostics, normalize_enabled, selected_ids
+from .skills import catalog as skill_catalog, discovery_diagnostics
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -74,7 +74,10 @@ class DocumentIn(BaseModel):
 class GenerateIn(BaseModel):
     intent: str
     current_document: dict[str, Any] = Field(default_factory=dict)
-    requested_count: int = Field(1, ge=1, le=4)
+    mode: Literal["create", "modify"] = "create"
+    conversation_id: str = ""
+    parent_run_id: str = ""
+    requested_count: int | None = Field(default=None, ge=1)
     include_chinese: bool = False
     provider_id: str = ""
     model: str = ""
@@ -252,11 +255,12 @@ def toggle_skill(skill_id: str, body: SkillToggleIn) -> dict[str, Any]:
     runtime = _runtime_settings()
     if skill_id not in {item["id"] for item in skill_catalog({})}:
         raise HTTPException(404, "skill not found")
-    enabled = normalize_enabled(runtime.get("skills"))
+    current = _runtime_settings()
+    enabled = dict(current.get("skills") or {})
     enabled[skill_id] = body.enabled
-    runtime["skills"] = enabled
+    current["skills"] = enabled
     with connect() as db:
-        db.execute("INSERT OR REPLACE INTO settings(key,payload,updated_at) VALUES(?,?,?)", ("runtime", json.dumps(runtime, ensure_ascii=False), now()))
+        db.execute("INSERT OR REPLACE INTO settings(key,payload,updated_at) VALUES(?,?,?)", ("runtime", json.dumps(current, ensure_ascii=False), now()))
     return next(item for item in skills()["items"] if item["id"] == skill_id)
 
 
@@ -354,8 +358,23 @@ async def test_provider(provider_id: str) -> dict[str, Any]:
 @app.post("/api/generate")
 async def generate(body: GenerateIn) -> dict[str, Any]:
     runtime = _runtime_settings()
-    original_intent = body.intent
-    body = body.model_copy(update={"intent": strip_explicit_markers(body.intent)})
+    request_intent = strip_explicit_markers(body.intent)
+    original_intent = request_intent
+    parent_run = None
+    if body.mode == "modify":
+        if not body.conversation_id or not body.parent_run_id:
+            raise HTTPException(400, "修改当前对话需要 conversation_id 和 parent_run_id")
+        with connect() as db:
+            parent_run = db.execute("SELECT * FROM agent_runs WHERE id=? AND conversation_id=?", (body.parent_run_id, body.conversation_id)).fetchone()
+        if not parent_run:
+            raise HTTPException(400, "当前对话版本不存在，请刷新后重试")
+        original_intent = parent_run["intent"]
+        current_document = dict(body.current_document or {})
+        current_document.setdefault("original_intent", original_intent)
+        current_document["modification_request"] = request_intent
+        body = body.model_copy(update={"intent": original_intent, "current_document": current_document})
+    else:
+        body = body.model_copy(update={"intent": request_intent})
     provider_id = body.provider_id or str(runtime.get("provider_id") or "")
     provider = _provider(provider_id)
     if provider_id and not provider:
@@ -363,14 +382,37 @@ async def generate(body: GenerateIn) -> dict[str, Any]:
     if not body.model:
         runtime_model = runtime.get("model") if provider_id and provider_id == runtime.get("provider_id") else ""
         body.model = str(runtime_model or (provider["model"] if provider else ""))
-    enabled_skills = dict(runtime.get("skills") or {})
-    enabled_skills["__mode"] = str(runtime.get("skill_mode") or "compact")
-    enabled_skills["__intent"] = body.intent
-    result = await generate_agent(body, provider, _provider_secret(provider), str(runtime.get("system_prompt") or ""), enabled_skills)
+    fallback_count = len((body.current_document or {}).get("variants", [])) if body.mode == "modify" else 1
+    parse_intent = (body.current_document or {}).get("modification_request", "") if body.mode == "modify" else body.intent
+    parsed_request = parse_generation_request(parse_intent or body.intent, fallback_count=fallback_count)
+    if parsed_request["explicit_count"]:
+        body = body.model_copy(update={"requested_count": parsed_request["requested_count"]})
+    capability_state = {item["id"]: True for item in skill_catalog({})}
+    capability_state.update(dict(runtime.get("skills") or {}))
+    capability_state["__intent"] = body.intent
+    capability_state["__mode"] = "compact"
+    capability_state["__requested_count"] = parsed_request["requested_count"]
+    capability_state["__variation_dimensions"] = parsed_request["variation_dimensions"]
+    capability_state["__dedupe_required"] = parsed_request["dedupe_required"]
+    capability_state["__selected_skill_ids"] = []
+    from .skills import selected_ids
+    capability_state["__selected_skill_ids"] = selected_ids(capability_state)
+    result = await generate_agent(body, provider, _provider_secret(provider), str(runtime.get("system_prompt") or ""), capability_state)
     run_id = str(uuid.uuid4())
-    response = {"id": run_id, "status": result["status"], "engine": result["engine"], "provider_id": provider["id"] if provider else "", "model": body.model, "reasoning_effort": body.reasoning_effort, "variants": result["variants"], "error": result.get("error"), "selected_skill_ids": selected_ids(enabled_skills), "skill_diagnostics": discovery_diagnostics(), "usage": {"latency_ms": result.get("latency_ms"), "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens")}}
+    conversation_id = body.conversation_id or run_id
     with connect() as db:
-        db.execute("INSERT INTO agent_runs VALUES(?,?,?,?,?,?,?,?,?)", (run_id, original_intent, body.model_dump_json(), json.dumps(response, ensure_ascii=False), result["status"], json.dumps(result.get("error") or {}, ensure_ascii=False), result["engine"], result.get("latency_ms"), now()))
+        latest_revision = db.execute("SELECT COALESCE(MAX(revision), 0) AS revision FROM agent_runs WHERE conversation_id=?", (conversation_id,)).fetchone()["revision"]
+    revision = int(latest_revision) + 1
+    all_skills = skill_catalog(runtime.get("skills"))
+    tool_trace = result.get("tool_trace") or []
+    response = {"id": run_id, "status": result["status"], "engine": result["engine"], "provider_id": provider["id"] if provider else "", "model": body.model, "reasoning_effort": body.reasoning_effort, "variants": result["variants"], "error": result.get("error"), "selected_skill_ids": result.get("selected_skill_ids") or capability_state["__selected_skill_ids"], "skill_diagnostics": discovery_diagnostics(), "variant_diagnostics": result.get("variant_diagnostics", []), "tool_trace": tool_trace, "usage": {"latency_ms": result.get("latency_ms"), "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens")}, "conversation_id": conversation_id, "parent_run_id": body.parent_run_id, "revision": revision, "mode": body.mode}
+    with connect() as db:
+        db.execute("INSERT INTO agent_runs (id,intent,request_json,response_json,status,error_json,engine,latency_ms,created_at,conversation_id,parent_run_id,revision,mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (run_id, original_intent, body.model_dump_json(), json.dumps(response, ensure_ascii=False), result["status"], json.dumps(result.get("error") or {}, ensure_ascii=False), result["engine"], result.get("latency_ms"), now(), conversation_id, body.parent_run_id, revision, body.mode))
+        for sequence, event in enumerate(tool_trace, 1):
+            db.execute(
+                "INSERT INTO agent_events VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), run_id, sequence, str(event.get("event_type") or ""), str(event.get("tool_name") or ""), json.dumps(event.get("arguments") or {}, ensure_ascii=False), json.dumps(event.get("result") or {}, ensure_ascii=False), str(event.get("status") or ""), event.get("latency_ms"), json.dumps(event.get("error") or {}, ensure_ascii=False), now()),
+            )
     return response
 
 
@@ -378,7 +420,22 @@ async def generate(body: GenerateIn) -> dict[str, Any]:
 def agent_runs(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
     with connect() as db:
         rows = db.execute("SELECT * FROM agent_runs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-    return {"items": [{**row_json(row), "request": _json(row["request_json"], {}), "response": _json(row["response_json"], {}), "error": _json(row["error_json"], {})} for row in rows]}
+    items = []
+    for row in rows:
+        item = {**row_json(row), "request": _json(row["request_json"], {}), "response": _json(row["response_json"], {}), "error": _json(row["error_json"], {})}
+        item["tool_trace"] = item["response"].get("tool_trace", []) if isinstance(item["response"], dict) else []
+        items.append(item)
+    return {"items": items}
+
+
+@app.get("/api/agent-runs/{run_id}/trace")
+def agent_run_trace(run_id: str) -> dict[str, Any]:
+    with connect() as db:
+        run = db.execute("SELECT id FROM agent_runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            raise HTTPException(404, "agent run not found")
+        rows = db.execute("SELECT * FROM agent_events WHERE run_id=? ORDER BY sequence", (run_id,)).fetchall()
+    return {"run_id": run_id, "items": [{**row_json(row), "arguments": _json(row["arguments_json"], {}), "result": _json(row["result_json"], {}), "error": _json(row["error_json"], {})} for row in rows]}
 
 
 @app.get("/api/workspace")
