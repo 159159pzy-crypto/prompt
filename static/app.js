@@ -1,40 +1,578 @@
-const state = { id: null, agents: [], agentId: 'anima-creator', variants: [], side: { positive: [], negative: [] }, mode: 'chips', settingsTree: [], section: 'ai', group: 'agents', currentSetting: null };
-const $ = (s) => document.querySelector(s); const $$ = (s) => [...document.querySelectorAll(s)];
-const api = async (path, options = {}) => { const response = await fetch(path, { headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }, ...options }); const data = await response.json(); if (!response.ok) throw new Error(data.detail || data.message || '请求失败'); return data; };
-const toast = (message) => { const el = $('#toast'); el.textContent = message; el.classList.add('show'); clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.remove('show'), 2300); };
-const escapeHtml = (v = '') => String(v).replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
-const copy = async (text) => { await navigator.clipboard.writeText(text); toast('已复制'); };
+const $ = (selector, root = document) => root.querySelector(selector);
+const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
-function splitPrompt(text) { const parts = []; let current = '', depth = 0; for (const char of text) { if (char === '(') depth++; if (char === ')') depth = Math.max(0, depth - 1); if (char === ',' && depth === 0) { if (current.trim()) parts.push(current.trim()); current = ''; } else current += char; } if (current.trim()) parts.push(current.trim()); return parts; }
-function categoryOf(tag) { const low = tag.toLowerCase(); if (/^<(lora|embed):/.test(low)) return 'LoRA / Embedding'; if (low === 'break') return 'Composition / Camera'; if (/masterpiece|best quality|score|highres/.test(low)) return 'Quality'; if (/low quality|bad anatomy|negative/.test(low)) return 'Negative'; if (/girl|boy|solo|character/.test(low)) return 'Character'; if (/hair|eyes|skin|smile|face/.test(low)) return 'Appearance'; if (/dress|shirt|skirt|uniform|clothes/.test(low)) return 'Clothing'; if (/standing|sitting|pose|looking/.test(low)) return 'Pose / Action'; if (/style|watercolor|painting|lineart/.test(low)) return 'Style / Medium'; if (/background|outdoors|sky|forest|room/.test(low)) return 'Background / Scene'; if (/lighting|glow|shadow|sparkle/.test(low)) return 'Lighting / Effect'; return 'Custom'; }
-function parseTokens(text, side) { return splitPrompt(text).map((raw, i) => { const match = raw.match(/^\((.*?):([\d.]+)\)$/s); const clean = match ? match[1] : raw; return { id: `${side}-${Date.now()}-${i}`, raw_text: clean, normalized_tag: clean.replace(/_/g, ' '), category: categoryOf(clean), weight: match ? Number(match[2]) : 1, source: 'manual', translation: '', locked: false }; }); }
-function serialize(side) { return state.side[side].map((t) => t.weight !== 1 ? `(${t.raw_text}:${t.weight})` : t.raw_text).join(', '); }
-function renderPrompt() { ['positive', 'negative'].forEach((side) => { const canvas = $(`#${side}Chips`); canvas.innerHTML = ''; state.side[side].forEach((token, index) => { const chip = document.createElement('div'); chip.className = 'chip'; chip.draggable = true; chip.dataset.category = token.category; chip.dataset.index = index; chip.innerHTML = `<span>${escapeHtml(token.raw_text)}</span>${token.weight !== 1 ? `<em>:${token.weight}</em>` : ''}<button class="chip-delete" title="删除">×</button>`; chip.addEventListener('dragstart', (e) => e.dataTransfer.setData('text/plain', String(index))); chip.addEventListener('dragover', (e) => e.preventDefault()); chip.addEventListener('drop', (e) => { e.preventDefault(); const from = Number(e.dataTransfer.getData('text/plain')); const [item] = state.side[side].splice(from, 1); state.side[side].splice(index, 0, item); renderPrompt(); }); chip.querySelector('.chip-delete').addEventListener('click', () => { state.side[side].splice(index, 1); renderPrompt(); }); chip.addEventListener('dblclick', () => { const next = prompt('编辑 tag', token.raw_text); if (next !== null && next.trim()) { token.raw_text = next.trim(); token.normalized_tag = token.raw_text.replace(/_/g, ' '); token.category = categoryOf(token.raw_text); renderPrompt(); } }); canvas.appendChild(chip); }); $(`#${side}Text`).value = serialize(side); }); $('#tokenCount').textContent = `${state.side.positive.length + state.side.negative.length} tokens`; }
-function setPrompt(positive, negative, title = '') { state.side.positive = parseTokens(positive || '', 'positive'); state.side.negative = parseTokens(negative || '', 'negative'); if (title) $('#promptTitle').value = title; renderPrompt(); recognizePrompt(); }
-async function recognizePrompt() { try { const result = await api('/api/catalog/recognize', { method: 'POST', body: JSON.stringify({ text: serialize('positive') }) }); $('#unknownCount').textContent = `${result.unknown.length} 个未识别`; } catch { $('#unknownCount').textContent = '识别暂不可用'; } }
-async function normalizePrompt() { const result = await api('/api/prompts/normalize', { method: 'POST', body: JSON.stringify({ positive: serialize('positive'), negative: serialize('negative') }) }); setPrompt(result.positive, result.negative); $('#normalizeState').textContent = result.changed ? `已规范化 · ${result.changes.length} 项变更` : '已符合 Anima 规范'; toast(result.changed ? '已应用 Anima 规范' : '提示词已符合规范'); }
+const REASONING_OPTIONS = [
+  { value: 'none', label: '不思考', description: '兼容性最好，不发送 reasoning_effort。' },
+  { value: 'minimal', label: '极简', description: '只使用最少推理预算。' },
+  { value: 'low', label: '低', description: '适合清晰、约束较少的画面。' },
+  { value: 'medium', label: '中', description: '在速度与复杂约束之间保持平衡。' },
+  { value: 'high', label: '高', description: '适合多主体和复杂视觉关系。' },
+  { value: 'xhigh', label: '极高', description: '使用路由支持的最高推理预算。' },
+];
 
-function renderAgents() { $('#agentSelect').innerHTML = state.agents.filter((a) => a.enabled).map((a) => `<option value="${a.id}">${escapeHtml(a.name)}</option>`).join(''); $('#agentSelect').value = state.agentId; $('#summaryAgent').textContent = state.agents.find((a) => a.id === state.agentId)?.name || '未选择'; }
-function addMessage(role, text) { const node = document.createElement('div'); node.className = `message ${role}`; node.innerHTML = role === 'user' ? `<span class="message-label">你</span><p>${escapeHtml(text)}</p>` : `<span class="message-label">Agent</span><p>${escapeHtml(text)}</p>`; $('#conversation').appendChild(node); $('#conversation').scrollTop = $('#conversation').scrollHeight; }
-function renderCandidates() { const target = $('#candidateList'); if (!state.variants.length) { target.innerHTML = '<div class="empty-state candidate-empty"><span class="empty-icon">◌</span><strong>等待 Agent 生成</strong><p>每次可以得到多组候选，先比较，再导入。</p></div>'; return; } target.innerHTML = state.variants.map((variant, index) => `<article class="candidate-card"><div class="candidate-card-head"><div><span class="candidate-index">0${index + 1}</span><strong>${escapeHtml(variant.title || `候选 ${index + 1}`)}</strong></div><span class="candidate-status">${variant.unknown_terms?.length ? `${variant.unknown_terms.length} 未识别` : '已检查'}</span></div><p class="candidate-description">${escapeHtml(variant.natural_language || '')}</p><div class="candidate-tags">${(variant.positive || []).slice(0, 12).map((tag) => `<span>${escapeHtml(tag)}</span>`).join('')}</div><div class="candidate-actions"><button data-import="replace" data-index="${index}" class="primary-button compact">替换右侧</button><button data-import="append" data-index="${index}" class="quiet-button">追加</button><button data-favorite-index="${index}" class="quiet-button">☆</button></div></article>`).join(''); $$('#candidateList [data-import]').forEach((button) => button.addEventListener('click', () => { const variant = state.variants[Number(button.dataset.index)]; const positive = button.dataset.import === 'append' ? `${serialize('positive')}, ${variant.positive?.join(', ') || ''}` : (variant.positive || []).join(', '); const negative = button.dataset.import === 'append' ? `${serialize('negative')}, ${variant.negative?.join(', ') || ''}` : (variant.negative || []).join(', '); setPrompt(positive, negative, variant.title); normalizePrompt(); })); $$('#candidateList [data-favorite-index]').forEach((button) => button.addEventListener('click', async () => { const variant = state.variants[Number(button.dataset.favoriteIndex)]; await api('/api/favorites', { method: 'POST', body: JSON.stringify({ kind: 'variant', title: variant.title || 'Agent variant', body: (variant.positive || []).join(', ') }) }); toast('候选已收藏'); })); }
-async function sendAgent() { const message = $('#agentMessage').value.trim(); if (!message) return; addMessage('user', message); $('#agentMessage').value = ''; $('#candidateList').innerHTML = '<div class="loading-state"><span class="spinner"></span><strong>Agent 正在构思候选…</strong></div>'; try { const result = await api('/api/agent-runs', { method: 'POST', body: JSON.stringify({ agent_id: state.agentId, message, max_variants: 3 }) }); state.variants = result.variants || []; addMessage('agent', `生成了 ${state.variants.length} 组候选，已完成 ${result.engine === 'local-fallback' ? '本地回退' : '模型'} 输出。`); renderCandidates(); } catch (error) { addMessage('agent', error.message); toast(error.message); } }
+const VIEW_TITLES = {
+  outputs: '输出结果',
+  model: '模型与路由',
+  provider: '供应商',
+  reasoning: '思考强度',
+  language: '语言与翻译',
+  skills: 'Skills',
+};
 
-function openSettings(section = state.section, group = state.group) { state.section = section; state.group = group; $('#settingsOverlay').classList.add('open'); $('#settingsOverlay').setAttribute('aria-hidden', 'false'); renderSettings(); }
-function closeSettings() { $('#settingsOverlay').classList.remove('open'); $('#settingsOverlay').setAttribute('aria-hidden', 'true'); }
-async function renderSettings() { const tree = state.settingsTree; $('#settingsSections').innerHTML = tree.map((item) => `<button class="settings-section ${item.id === state.section ? 'active' : ''}" data-section="${item.id}"><span>${sectionIcon(item.id)}</span>${escapeHtml(item.label)}</button>`).join(''); $$('.settings-section').forEach((button) => button.addEventListener('click', () => { state.section = button.dataset.section; state.group = tree.find((x) => x.id === state.section)?.groups[0]?.id || ''; renderSettings(); })); const current = tree.find((item) => item.id === state.section) || tree[0]; $('#settingsGroups').innerHTML = (current?.groups || []).map((item) => `<button class="settings-group ${item.id === state.group ? 'active' : ''}" data-group="${item.id}">${escapeHtml(item.label)}</button>`).join(''); $$('.settings-group').forEach((button) => button.addEventListener('click', () => { state.group = button.dataset.group; renderSettings(); })); await renderSettingContent(); }
-function sectionIcon(id) { return ({ ai: '✦', providers: '◈', translation: '文', catalog: '⌘', anima: 'A', appearance: '◐', data: '▣', diagnostics: '⌁' })[id] || '•'; }
-async function renderSettingContent() { const title = state.settingsTree.find((x) => x.id === state.section)?.label || ''; const label = state.settingsTree.find((x) => x.id === state.section)?.groups.find((x) => x.id === state.group)?.label || ''; $('#settingsContent').innerHTML = `<div class="settings-breadcrumb">设置 <span>/</span> ${escapeHtml(title)} <span>/</span> ${escapeHtml(label)}</div><div class="settings-title"><span class="eyebrow">${escapeHtml(title.toUpperCase())}</span><h2>${escapeHtml(label)}</h2><p>所有配置都在这里管理，工作区只显示当前状态。</p></div><div id="settingForm" class="setting-form"><span class="loading-state">正在读取设置…</span></div>`; const form = $('#settingForm'); if (state.section === 'ai' && state.group === 'agents') return renderAgentSettings(form); if (state.section === 'providers') return renderProviderSettings(form); if (state.section === 'translation') return renderTranslationSettings(form); if (state.section === 'catalog') return renderCatalogSettings(form); if (state.section === 'anima') return renderAnimaSettings(form); if (state.section === 'appearance') return renderAppearanceSettings(form); if (state.section === 'diagnostics') return renderDiagnosticSettings(form); if (state.section === 'ai' && state.group === 'defaults') return renderJsonSetting(form, 'ai', 'defaults', '默认 Agent 和候选数量'); if (state.section === 'ai' && state.group === 'runtime') return renderJsonSetting(form, 'ai', 'runtime', 'Agent 运行参数'); if (state.section === 'data') return renderDataSettings(form); return renderJsonSetting(form, state.section, state.group, '设置'); }
-async function renderAgentSettings(form) { const data = await api('/api/agents'); const agent = data.items.find((x) => x.id === state.agentId) || data.items[0]; form.innerHTML = `<div class="settings-card"><label>Agent<select id="settingAgentSelect">${data.items.map((x) => `<option value="${x.id}">${escapeHtml(x.name)}</option>`).join('')}</select></label><label>名称<input id="agentName" value="${escapeHtml(agent.name)}"></label><label>人格<textarea id="agentPersona">${escapeHtml(agent.persona)}</textarea></label><label>系统提示词<textarea id="agentSystem" class="large-text">${escapeHtml(agent.system_prompt)}</textarea></label><label>输出协议 JSON<textarea id="agentSchema" class="large-text">${escapeHtml(JSON.stringify(agent.output_schema, null, 2))}</textarea></label><div class="form-actions"><button id="saveAgent" class="primary-button">保存 Agent</button><button id="testAgent" class="quiet-button">测试输出</button></div></div>`; $('#settingAgentSelect').value = agent.id; $('#settingAgentSelect').addEventListener('change', (e) => { state.agentId = e.target.value; renderSettings(); renderAgents(); }); $('#saveAgent').addEventListener('click', async () => { const current = data.items.find((x) => x.id === $('#settingAgentSelect').value); await api(`/api/agents/${current.id}`, { method: 'PATCH', body: JSON.stringify({ ...current, name: $('#agentName').value, persona: $('#agentPersona').value, system_prompt: $('#agentSystem').value, output_schema: JSON.parse($('#agentSchema').value) }) }); await loadAgents(); toast('Agent 设置已保存'); }); $('#testAgent').addEventListener('click', () => { closeSettings(); $('#agentMessage').value = '请用一组简短结果测试你的输出格式'; $('#agentForm').requestSubmit(); }); }
-async function renderProviderSettings(form) { const data = await api('/api/providers'); form.innerHTML = `<div class="settings-card"><div class="provider-list">${data.items.map((x) => `<div class="provider-row"><div><strong>${escapeHtml(x.name)}</strong><small>${escapeHtml(x.model)} · ${x.has_api_key ? '凭据已配置' : '未配置凭据'}</small></div><span>${escapeHtml(x.base_url)}</span></div>`).join('') || '<p class="muted">尚未配置供应商。</p>'}</div><hr><h3>添加 OpenAI 兼容供应商</h3><label>名称<input id="providerName" placeholder="Local Qwen"></label><label>Base URL<input id="providerUrl" placeholder="https://api.example.com/v1"></label><label>模型<input id="providerModel" placeholder="模型 ID"></label><label>API key<input id="providerKey" type="password" placeholder="仅本机保存"></label><div class="form-actions"><button id="saveProvider" class="primary-button">保存供应商</button></div></div>`; $('#saveProvider').addEventListener('click', async () => { await api('/api/providers', { method: 'POST', body: JSON.stringify({ name: $('#providerName').value, base_url: $('#providerUrl').value, model: $('#providerModel').value, api_key: $('#providerKey').value }) }); toast('供应商已保存'); renderSettingContent(); }); }
-async function renderTranslationSettings(form) { const config = await api('/api/translation/config'); form.innerHTML = `<div class="settings-card"><label>首选引擎<select id="translationEngine"><option value="google">Google Cloud Translation</option><option value="libretranslate">LibreTranslate</option><option value="argos">Argos Translate</option><option value="agent">Translation Agent</option></select></label><label>Google API Endpoint<input id="googleEndpoint" value="${escapeHtml(config.google_endpoint)}"></label><label>Google API key<input id="googleKey" type="password" placeholder="${config.has_google_api_key ? '已配置，留空保持不变' : '粘贴 API key'}"></label><div class="form-row"><label>源语言<input id="sourceLanguage" value="${escapeHtml(config.source_language)}"></label><label>目标语言<input id="targetLanguage" value="${escapeHtml(config.target_language)}"></label></div><label class="check-row"><input id="translationCache" type="checkbox" ${config.cache_enabled ? 'checked' : ''}>启用翻译缓存</label><div class="form-actions"><button id="saveTranslation" class="primary-button">保存翻译设置</button><button id="testTranslation" class="quiet-button">测试 Google</button></div><p class="setting-note">翻译只作中文辅助显示，最终英文 tag 不会被自动替换。</p></div>`; $('#translationEngine').value = config.primary_engine; $('#saveTranslation').addEventListener('click', async () => { await api('/api/translation/config', { method: 'PUT', body: JSON.stringify({ primary_engine: $('#translationEngine').value, google_endpoint: $('#googleEndpoint').value, google_api_key: $('#googleKey').value, source_language: $('#sourceLanguage').value, target_language: $('#targetLanguage').value, cache_enabled: $('#translationCache').checked }) }); toast('翻译设置已保存'); updateSummaries(); }); $('#testTranslation').addEventListener('click', async () => { const result = await api('/api/translation/test', { method: 'POST' }); toast(result.ok ? 'Google 翻译连接成功' : result.error); }); }
-async function renderCatalogSettings(form) { const data = await api('/api/catalog/sources'); form.innerHTML = `<div class="settings-card"><div class="source-list">${data.items.map((x) => `<div class="source-row"><div><strong>${escapeHtml(x.name)}</strong><small>${escapeHtml(x.location)}</small></div><span class="source-state ${x.status}">${escapeHtml(x.status)}</span><button data-sync-source="${x.id}" class="quiet-button">同步</button></div>`).join('')}</div><p class="setting-note">多源合并按优先级执行；在线 Danbooru 不作为运行时依赖。</p></div>`; $$('[data-sync-source]').forEach((button) => button.addEventListener('click', async () => { const result = await api(`/api/catalog/sources/sync?source_id=${button.dataset.syncSource}`, { method: 'POST' }); toast(result.ok ? '数据源已确认' : result.message); })); }
-async function renderAnimaSettings(form) { form.innerHTML = `<div class="settings-card rule-card"><h3>固定 Anima 规范管线</h3><p>规范化不依赖 Skills，所有 Agent 结果导入 Prompt Document 前自动执行。</p><div class="rule-grid"><span>score 8 up → score_8_up</span><span>red_hair → red hair</span><span>重复 tag 自动去重</span><span>LoRA 触发词保持原样</span><span>year 2024 统一格式</span><span>未知 tag 保留并警告</span></div><button id="restoreLast" class="quiet-button">查看规范化历史</button></div>`; }
-async function renderAppearanceSettings(form) { const data = await api('/api/settings/appearance/theme'); const motion = await api('/api/settings/appearance/motion'); form.innerHTML = `<div class="settings-card"><label>主题<select id="themeSelect"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label><label>毛玻璃强度<input id="glassRange" type="range" min="0" max="1" step="0.05" value="${data.payload.glass_strength || 0.72}"></label><label>动效强度<select id="motionSelect"><option value="full">完整</option><option value="reduced">减少</option></select></label><label class="check-row"><input id="contrastToggle" type="checkbox" ${data.payload.high_contrast ? 'checked' : ''}>高对比度</label><button id="saveAppearance" class="primary-button">保存外观设置</button></div>`; $('#themeSelect').value = data.payload.theme || 'system'; $('#motionSelect').value = motion.payload.motion || 'full'; $('#saveAppearance').addEventListener('click', async () => { await api('/api/settings/appearance/theme', { method: 'PUT', body: JSON.stringify({ theme: $('#themeSelect').value, glass_strength: Number($('#glassRange').value), high_contrast: $('#contrastToggle').checked }) }); await api('/api/settings/appearance/motion', { method: 'PUT', body: JSON.stringify({ motion: $('#motionSelect').value, reduce_motion: $('#motionSelect').value === 'reduced' }) }); document.body.dataset.theme = $('#themeSelect').value; document.body.dataset.motion = $('#motionSelect').value; toast('外观设置已保存'); }); }
-async function renderJsonSetting(form, section, group, title) { const data = await api(`/api/settings/${section}/${group}`); form.innerHTML = `<div class="settings-card"><label>${escapeHtml(title)}<textarea id="jsonSetting" class="large-text">${escapeHtml(JSON.stringify(data.payload, null, 2))}</textarea></label><button id="saveJsonSetting" class="primary-button">保存设置</button></div>`; $('#saveJsonSetting').addEventListener('click', async () => { await api(`/api/settings/${section}/${group}`, { method: 'PUT', body: JSON.stringify(JSON.parse($('#jsonSetting').value)) }); toast('设置已保存'); }); }
-async function renderDataSettings(form) { form.innerHTML = '<div class="settings-card"><h3>数据与备份</h3><p>提示词、收藏和配置均保存在本机 SQLite。导出功能将在这里统一管理。</p><button class="quiet-button" id="dataStatus">检查本地数据</button></div>'; $('#dataStatus').addEventListener('click', async () => { const result = await api('/api/status'); toast(`本地数据库正常 · ${result.tag_count} tags`); }); }
-async function renderDiagnosticSettings(form) { const result = await api('/api/status'); form.innerHTML = `<div class="settings-card diagnostic-grid"><div><span>服务</span><strong>${result.ok ? '在线' : '异常'}</strong></div><div><span>版本</span><strong>${result.version}</strong></div><div><span>Tag 数量</span><strong>${result.tag_count}</strong></div><div><span>启用 Agent</span><strong>${result.enabled_agents}</strong></div></div>`; }
-async function updateSummaries() { const config = await api('/api/translation/config'); $('#summaryTranslation').textContent = config.has_google_api_key ? 'Google Cloud · 已配置' : 'Google Cloud · 未配置'; }
+const state = {
+  settings: {
+    requested_count: 1,
+    include_chinese: false,
+    provider_id: '',
+    model: '',
+    reasoning_effort: 'none',
+  },
+  providers: [],
+  skills: [],
+  runs: [],
+  variants: [],
+  activeRunId: '',
+  activeIntent: '',
+  runError: '',
+  busy: false,
+};
 
-async function bootstrap() { const [tree, agents] = await Promise.all([api('/api/settings/tree'), api('/api/agents')]); state.settingsTree = tree.items; state.agents = agents.items; renderAgents(); setPrompt('masterpiece, best quality, 1girl, portrait, long hair, soft lighting', 'low quality, bad anatomy'); updateSummaries(); }
-$('#agentForm').addEventListener('submit', (e) => { e.preventDefault(); sendAgent(); }); $('#agentMessage').addEventListener('keydown', (e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); sendAgent(); } }); $('#agentSelect').addEventListener('change', (e) => { state.agentId = e.target.value; $('#summaryAgent').textContent = state.agents.find((a) => a.id === state.agentId)?.name || '未选择'; }); $('#clearConversation').addEventListener('click', () => { $('#conversation').innerHTML = '<div class="empty-state"><span class="empty-icon">✦</span><strong>对话已清空</strong><p>告诉 Agent 你的下一组画面需求。</p></div>'; state.variants = []; renderCandidates(); }); $('#refreshCandidates').addEventListener('click', () => { if ($('#agentMessage').value.trim()) sendAgent(); else toast('先输入一条新的创作要求'); }); $('#clearPrompt').addEventListener('click', () => { setPrompt('', ''); $('#promptTitle').value = 'Untitled Anima prompt'; toast('右侧 Prompt 已清空，可撤销由浏览器完成'); }); $('#normalizePrompt').addEventListener('click', normalizePrompt); $('#savePrompt').addEventListener('click', async () => { const body = { title: $('#promptTitle').value, positive: serialize('positive'), negative: serialize('negative'), payload: { positive: state.side.positive, negative: state.side.negative } }; const saved = state.id ? await api(`/api/prompts/${state.id}`, { method: 'PATCH', body: JSON.stringify(body) }) : await api('/api/prompts', { method: 'POST', body: JSON.stringify(body) }); state.id = saved.id; toast('Prompt Document 已保存'); }); $('#favoritePrompt').addEventListener('click', async () => { await api('/api/favorites', { method: 'POST', body: JSON.stringify({ kind: 'prompt', title: $('#promptTitle').value, body: serialize('positive') }) }); toast('已收藏'); }); $('#copyAll').addEventListener('click', () => copy(`Positive: ${serialize('positive')}\nNegative: ${serialize('negative')}`)); $$('[data-copy]').forEach((button) => button.addEventListener('click', () => copy(serialize(button.dataset.copy)))); $$('.segment').forEach((button) => button.addEventListener('click', () => { state.mode = button.dataset.mode; $$('.segment').forEach((x) => x.classList.toggle('active', x === button)); const chips = state.mode === 'chips'; $('#positiveChips').hidden = chips === false; $('#negativeChips').hidden = chips === false; $('#positiveText').hidden = chips; $('#negativeText').hidden = chips; })); $('#positiveText').addEventListener('input', () => { state.side.positive = parseTokens($('#positiveText').value, 'positive'); renderPrompt(); }); $('#negativeText').addEventListener('input', () => { state.side.negative = parseTokens($('#negativeText').value, 'negative'); renderPrompt(); }); $('#newPrompt').addEventListener('click', () => { state.id = null; state.variants = []; setPrompt('', ''); $('#promptTitle').value = 'Untitled Anima prompt'; renderCandidates(); toast('已新建 Prompt Document'); }); $('#settingsButton').addEventListener('click', () => openSettings()); $('#closeSettings').addEventListener('click', closeSettings); $$('[data-close-settings]').forEach((el) => el.addEventListener('click', closeSettings)); $('#agentSummary').addEventListener('click', () => openSettings('ai', 'agents')); $$('[data-setting]').forEach((el) => el.addEventListener('click', () => { const [section, group] = el.dataset.setting.split('/'); openSettings(section, group); })); bootstrap().catch((error) => { $('#statusPill').classList.add('error'); $('#statusPill').innerHTML = '<i></i>后端未启动'; toast(error.message); });
+async function api(path, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeout || 120000);
+  try {
+    const response = await fetch(path, {
+      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+      signal: controller.signal,
+      ...options,
+    });
+    const text = await response.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch { data = { detail: text }; }
+    if (!response.ok) {
+      const detail = typeof data.detail === 'object'
+        ? data.detail.message || JSON.stringify(data.detail)
+        : data.detail;
+      throw new Error(detail || `请求失败 (${response.status})`);
+    }
+    return data;
+  } catch (error) {
+    if (error.name === 'AbortError') throw new Error('请求超时，请检查本地服务或供应商状态');
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
+const escapeHtml = (value = '') => String(value).replace(/[&<>"']/g, (char) => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+}[char]));
+
+function clampCount(value) {
+  return Math.max(1, Math.min(3, Number(value) || 1));
+}
+
+function showToast(message) {
+  const toast = $('#toast');
+  toast.textContent = message;
+  toast.classList.add('show');
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => toast.classList.remove('show'), 2200);
+}
+
+function setServiceStatus(online, text = '') {
+  const target = $('#serviceStatus');
+  target.className = `online ${online ? '' : 'offline'}`.trim();
+  $('span', target).textContent = text || (online ? '本地服务在线' : '本地服务离线');
+}
+
+function setRunMessage(message = '', tone = '') {
+  const target = $('#runMessage');
+  target.hidden = !message;
+  target.textContent = message;
+  target.className = `run-message ${tone}`.trim();
+}
+
+function serialize(tokens = []) {
+  return tokens.map((token) => {
+    const raw = String(token?.raw_text || '').trim();
+    const weight = Number(token?.weight || 1);
+    return weight !== 1 ? `(${raw}:${weight})` : raw;
+  }).filter(Boolean).join(', ');
+}
+
+function chineseText(variant) {
+  const translations = variant?.positive_translations || [];
+  return translations.length ? translations.join('，') : '';
+}
+
+async function copyText(value, successMessage = '已复制到剪贴板') {
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    showToast(successMessage);
+  } catch {
+    const fallback = document.createElement('textarea');
+    fallback.value = value;
+    fallback.setAttribute('readonly', '');
+    fallback.style.position = 'fixed';
+    fallback.style.opacity = '0';
+    document.body.appendChild(fallback);
+    fallback.select();
+    const copied = document.execCommand('copy');
+    fallback.remove();
+    showToast(copied ? successMessage : '复制失败，请手动选择');
+  }
+}
+
+function currentProvider() {
+  return state.providers.find((provider) => provider.enabled && provider.id === state.settings.provider_id)
+    || state.providers.find((provider) => provider.enabled)
+    || null;
+}
+
+function providerModels(provider) {
+  return [...new Set([...(provider?.models || []), provider?.model || ''].filter(Boolean))];
+}
+
+function formatRelativeTime(value) {
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return '未知时间';
+  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (seconds < 60) return '刚刚';
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
+  if (seconds < 604800) return `${Math.floor(seconds / 86400)} 天前`;
+  return new Date(value).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+}
+
+function renderRuns() {
+  const target = $('#conversationList');
+  if (!state.runs.length) {
+    target.innerHTML = '<div class="sidebar-empty">还没有生成记录。</div>';
+    return;
+  }
+  target.innerHTML = state.runs.map((run) => {
+    const variants = run.response?.variants || [];
+    const status = run.status === 'completed' ? `${variants.length} 个生成结果` : '生成失败';
+    return `<button class="conversation ${run.id === state.activeRunId ? 'active' : ''}" type="button" data-run-id="${escapeHtml(run.id)}"><strong>${escapeHtml(run.intent || '未命名对话')}</strong><small>${escapeHtml(formatRelativeTime(run.created_at))} · ${escapeHtml(status)}</small></button>`;
+  }).join('');
+}
+
+function renderResults() {
+  const target = $('#resultGrid');
+  const count = state.variants.length;
+  $('#resultEyebrowCount').textContent = String(count).padStart(2, '0');
+  $('#copyAll').hidden = !count;
+  if (state.busy) {
+    $('#resultMeta').textContent = 'Agent 正在生成正面 Prompt';
+    target.innerHTML = '<div class="empty-state loading-state"><strong>正在生成</strong><span>请求可能需要一些时间，请保持页面打开。</span></div>';
+    return;
+  }
+  if (!count) {
+    $('#resultMeta').textContent = state.runError || '等待输入画面描述';
+    target.innerHTML = `<div class="empty-state"><strong>${state.runError ? '没有生成结果' : '等待生成'}</strong><span>${escapeHtml(state.runError || '真实结果会显示在这里。')}</span></div>`;
+    return;
+  }
+  $('#resultMeta').textContent = `已生成 ${count} 个视觉方向 · 仅正面 Prompt`;
+  target.innerHTML = state.variants.map((variant, index) => {
+    const prompt = serialize(variant.positive_tokens);
+    const translation = chineseText(variant);
+    const translationBlock = state.settings.include_chinese
+      ? `<div class="box-label translation-label"><span>中文逐项对照</span><button class="copy-link copy-translation" type="button" data-result-index="${index}">复制</button></div><div class="output-box cn">${escapeHtml(translation || '该记录没有中文对照')}</div>`
+      : '';
+    return `<article class="result-card"><header><h3>${escapeHtml(variant.title || `候选 ${index + 1}`)}</h3><span class="result-number">${String(index + 1).padStart(2, '0')} / ${String(count).padStart(2, '0')}</span></header><div class="box-label"><span>ENGLISH POSITIVE PROMPT</span><button class="copy-link copy-result" type="button" data-result-index="${index}">复制</button></div><div class="output-box">${escapeHtml(prompt || '模型未返回正面 Token')}</div>${translationBlock}</article>`;
+  }).join('');
+}
+
+function renderRouteControls() {
+  const enabled = state.providers.filter((provider) => provider.enabled);
+  const provider = currentProvider();
+  if (provider && provider.id !== state.settings.provider_id) state.settings.provider_id = provider.id;
+  if (!provider) state.settings.provider_id = '';
+
+  $('#routeProvider').innerHTML = enabled.length
+    ? enabled.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === provider?.id ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('')
+    : '<option value="">没有启用的供应商</option>';
+  $('#routeProvider').disabled = !enabled.length;
+
+  const models = providerModels(provider);
+  if (!models.includes(state.settings.model)) state.settings.model = provider?.model || models[0] || '';
+  $('#routeModel').innerHTML = models.length
+    ? models.map((model) => `<option value="${escapeHtml(model)}" ${model === state.settings.model ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('')
+    : '<option value="">没有可用模型</option>';
+  $('#routeModel').disabled = !models.length;
+
+  $('#routeReasoning').innerHTML = REASONING_OPTIONS.map((option) => `<option value="${option.value}">${option.label}</option>`).join('');
+  $('#routeReasoning').value = state.settings.reasoning_effort || 'none';
+  $('#resultCount').value = String(clampCount(state.settings.requested_count));
+  $('#generateButton').disabled = state.busy || !provider || !state.settings.model;
+}
+
+function renderProviders() {
+  const target = $('#providerRows');
+  if (!state.providers.length) {
+    target.innerHTML = '<div class="settings-empty">尚未配置供应商。此精简界面不提供新增入口。</div>';
+    return;
+  }
+  target.innerHTML = state.providers.map((provider) => `<div class="setting-row"><span><strong>${escapeHtml(provider.name)}</strong><small>${escapeHtml(provider.base_url)} · ${provider.models?.length || 0} 个模型</small></span><button class="toggle provider-toggle ${provider.enabled ? 'on' : ''}" type="button" role="switch" aria-checked="${Boolean(provider.enabled)}" aria-label="${provider.enabled ? '停用' : '启用'} ${escapeHtml(provider.name)}" data-provider-id="${escapeHtml(provider.id)}"></button></div>`).join('');
+}
+
+function renderReasoning() {
+  const current = state.settings.reasoning_effort || 'none';
+  $('#reasoningRows').innerHTML = REASONING_OPTIONS.map((option) => `<button class="setting-row reasoning-choice" type="button" role="radio" aria-checked="${option.value === current}" data-reasoning="${option.value}"><span><strong>${option.label}</strong><small>${option.description}</small></span><span class="toggle ${option.value === current ? 'on' : ''}" aria-hidden="true"></span></button>`).join('');
+}
+
+function renderLanguage() {
+  const enabled = Boolean(state.settings.include_chinese);
+  $('#includeChineseToggle').classList.toggle('on', enabled);
+  $('#includeChineseToggle').setAttribute('aria-checked', String(enabled));
+  $('#outputLanguage').value = enabled ? 'bilingual' : 'english';
+}
+
+function renderSkills() {
+  const target = $('#skillsRows');
+  if (!state.skills.length) {
+    target.innerHTML = '<div class="settings-empty">没有可用 Skills。</div>';
+    return;
+  }
+  target.innerHTML = state.skills.map((skill) => `<div class="setting-row"><span><strong>${escapeHtml(skill.name)}</strong><small>${escapeHtml(skill.description)}</small></span><button class="toggle skill-toggle ${skill.enabled ? 'on' : ''}" type="button" role="switch" aria-checked="${Boolean(skill.enabled)}" aria-label="${skill.enabled ? '停用' : '启用'} ${escapeHtml(skill.name)}" data-skill-id="${escapeHtml(skill.id)}"></button></div>`).join('');
+  $('#skillMode').value = state.settings.skill_mode || 'compact';
+}
+
+function renderAll() {
+  renderRuns();
+  renderResults();
+  renderRouteControls();
+  renderProviders();
+  renderReasoning();
+  renderLanguage();
+  renderSkills();
+  $('#conversationTitle').textContent = state.activeIntent || '新对话';
+}
+
+function applyWorkspace(workspace) {
+  state.settings = {
+    ...state.settings,
+    ...(workspace.runtime || {}),
+    requested_count: clampCount(workspace.runtime?.requested_count),
+  };
+  state.providers = workspace.providers || [];
+  state.skills = workspace.skills || [];
+  state.runs = workspace.recent_runs || [];
+  const provider = currentProvider();
+  state.settings.provider_id = provider?.id || '';
+  if (!providerModels(provider).includes(state.settings.model)) {
+    state.settings.model = provider?.model || providerModels(provider)[0] || '';
+  }
+}
+
+function closeWorkspaceMenu() {
+  $('#workspaceMenu').hidden = true;
+  $('#moreActions').setAttribute('aria-expanded', 'false');
+}
+
+async function refreshWorkspace(selectLatest = false) {
+  const activeRunId = state.activeRunId;
+  const workspace = await api('/api/workspace?limit=20');
+  applyWorkspace(workspace);
+  setServiceStatus(true);
+  renderAll();
+  if (selectLatest && state.runs.length) selectRun(state.runs[0].id);
+  else if (activeRunId && state.runs.some((run) => run.id === activeRunId)) selectRun(activeRunId);
+}
+
+async function persistRuntime(patch) {
+  const result = await api('/api/settings/runtime', {
+    method: 'PUT',
+    body: JSON.stringify(patch),
+  });
+  state.settings = { ...state.settings, ...(result.payload || {}) };
+  state.settings.requested_count = clampCount(state.settings.requested_count);
+}
+
+function selectRun(runId) {
+  const run = state.runs.find((item) => item.id === runId);
+  if (!run) return;
+  state.activeRunId = run.id;
+  state.activeIntent = run.intent || '';
+  state.variants = run.response?.variants || [];
+  state.runError = run.response?.error?.message || run.error?.message || '';
+  $('#intentInput').value = state.activeIntent;
+  setRunMessage(state.runError, state.runError ? 'error' : '');
+  showView('outputs');
+  renderRuns();
+  renderResults();
+  $('#conversationTitle').textContent = state.activeIntent || '新对话';
+}
+
+function newChat() {
+  state.activeRunId = '';
+  state.activeIntent = '';
+  state.variants = [];
+  state.runError = '';
+  $('#intentInput').value = '';
+  setRunMessage();
+  showView('outputs');
+  renderRuns();
+  renderResults();
+  $('#conversationTitle').textContent = '新对话';
+  $('#intentInput').focus();
+}
+
+function showView(view) {
+  $$('[data-view]').forEach((item) => item.classList.toggle('selected', item.dataset.view === view));
+  $$('[data-view-panel]').forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== view; });
+  $('#workspaceTitle').textContent = VIEW_TITLES[view] || 'Agent Studio';
+  $('#content').scrollTop = 0;
+}
+
+async function loadRuns(selectLatest = false) {
+  const data = await api('/api/agent-runs?limit=20');
+  state.runs = data.items || [];
+  if (selectLatest && state.runs.length) selectRun(state.runs[0].id);
+  else renderRuns();
+}
+
+async function generate() {
+  const intent = $('#intentInput').value.trim();
+  if (!intent) {
+    showToast('请先描述你想生成的画面');
+    $('#intentInput').focus();
+    return;
+  }
+  const provider = currentProvider();
+  if (!provider || !state.settings.model) {
+    showToast('没有可用供应商或模型');
+    showView('model');
+    return;
+  }
+
+  const requestedCount = clampCount($('#resultCount').value);
+  state.settings.requested_count = requestedCount;
+  state.busy = true;
+  state.activeRunId = '';
+  state.activeIntent = intent;
+  state.variants = [];
+  state.runError = '';
+  setRunMessage('正在请求模型，请保持页面打开。');
+  renderResults();
+  renderRouteControls();
+  $('#conversationTitle').textContent = intent;
+
+  try {
+    await persistRuntime({ requested_count: requestedCount });
+    const result = await api('/api/generate', {
+      method: 'POST',
+      body: JSON.stringify({
+        intent,
+        current_document: {},
+        requested_count: requestedCount,
+        include_chinese: Boolean(state.settings.include_chinese),
+        provider_id: provider.id,
+        model: state.settings.model,
+        reasoning_effort: state.settings.reasoning_effort || 'none',
+      }),
+    });
+    state.activeRunId = result.id || '';
+    state.variants = result.status === 'completed' ? result.variants || [] : [];
+    state.runError = result.error?.message || '';
+    if (result.status === 'completed') {
+      setRunMessage(`生成完成 · ${result.model} · ${state.variants.length} 个结果`);
+      showToast('生成完成');
+    } else {
+      setRunMessage(state.runError || '生成失败', 'error');
+    }
+    await loadRuns(false);
+  } catch (error) {
+    state.runError = error.message;
+    setRunMessage(error.message, 'error');
+    showToast(error.message);
+  } finally {
+    state.busy = false;
+    renderResults();
+    renderRouteControls();
+  }
+}
+
+async function changeRoute(patch) {
+  try {
+    await persistRuntime(patch);
+    renderRouteControls();
+    renderReasoning();
+    showToast('模型路由已保存');
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function toggleProvider(providerId, button) {
+  const provider = state.providers.find((item) => item.id === providerId);
+  if (!provider) return;
+  button.disabled = true;
+  try {
+    const updated = await api(`/api/providers/${provider.id}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        name: provider.name,
+        base_url: provider.base_url,
+        model: provider.model,
+        env_name: provider.env_name || '',
+        temperature: provider.temperature,
+        max_tokens: provider.max_tokens,
+        timeout: provider.timeout,
+        enabled: !provider.enabled,
+      }),
+    });
+    state.providers = state.providers.map((item) => item.id === updated.id ? updated : item);
+    const selected = currentProvider();
+    state.settings.provider_id = selected?.id || '';
+    state.settings.model = selected?.model || providerModels(selected)[0] || '';
+    await persistRuntime({ provider_id: state.settings.provider_id, model: state.settings.model });
+    renderProviders();
+    renderRouteControls();
+    showToast(updated.enabled ? '供应商已启用' : '供应商已停用');
+  } catch (error) {
+    showToast(error.message);
+    button.disabled = false;
+  }
+}
+
+async function setChinese(enabled) {
+  try {
+    await persistRuntime({ include_chinese: enabled });
+    state.settings.include_chinese = enabled;
+    renderLanguage();
+    renderResults();
+    showToast(enabled ? '已开启中文对照' : '已切换为仅英文');
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function toggleSkill(skillId, button) {
+  const skill = state.skills.find((item) => item.id === skillId);
+  if (!skill) return;
+  button.disabled = true;
+  try {
+    const updated = await api(`/api/skills/${skillId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ enabled: !skill.enabled }),
+    });
+    state.skills = state.skills.map((item) => item.id === skillId ? updated : item);
+    renderSkills();
+    showToast(updated.enabled ? 'Skill 已启用' : 'Skill 已停用');
+  } catch (error) {
+    showToast(error.message);
+    button.disabled = false;
+  }
+}
+
+function bindEvents() {
+  $('#moreActions').addEventListener('click', (event) => {
+    event.stopPropagation();
+    const menu = $('#workspaceMenu');
+    menu.hidden = !menu.hidden;
+    $('#moreActions').setAttribute('aria-expanded', String(!menu.hidden));
+  });
+  $('#workspaceMenu').addEventListener('click', (event) => event.stopPropagation());
+  document.addEventListener('click', closeWorkspaceMenu);
+  $('#refreshWorkspace').addEventListener('click', async () => {
+    closeWorkspaceMenu();
+    try { await refreshWorkspace(false); showToast('工作区已刷新'); }
+    catch (error) { setServiceStatus(false); showToast(error.message); }
+  });
+  $('#diagnoseService').addEventListener('click', async () => {
+    closeWorkspaceMenu();
+    try {
+      const result = await api('/api/status', { timeout: 5000 });
+      setServiceStatus(true);
+      showToast(`服务正常 · schema v${result.schema_version} · ${result.enabled_providers} 个供应商`);
+    } catch (error) {
+      setServiceStatus(false);
+      showToast(error.message);
+    }
+  });
+  $('#newChat').addEventListener('click', newChat);
+  $('#generateButton').addEventListener('click', generate);
+  $('#intentInput').addEventListener('keydown', (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') generate();
+  });
+  $('#resultCount').addEventListener('change', async (event) => {
+    const count = clampCount(event.target.value);
+    state.settings.requested_count = count;
+    try { await persistRuntime({ requested_count: count }); } catch (error) { showToast(error.message); }
+  });
+  $('#copyAll').addEventListener('click', () => copyText(state.variants.map((variant) => serialize(variant.positive_tokens)).join('\n\n'), '已复制全部英文 Prompt'));
+
+  $('#conversationList').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-run-id]');
+    if (button) selectRun(button.dataset.runId);
+  });
+  $('#resultGrid').addEventListener('click', (event) => {
+    const promptButton = event.target.closest('.copy-result');
+    if (promptButton) copyText(serialize(state.variants[Number(promptButton.dataset.resultIndex)]?.positive_tokens));
+    const translationButton = event.target.closest('.copy-translation');
+    if (translationButton) copyText(chineseText(state.variants[Number(translationButton.dataset.resultIndex)]), '已复制中文对照');
+  });
+
+  $$('[data-view]').forEach((button) => button.addEventListener('click', () => showView(button.dataset.view)));
+  $('#settingsTreeRoot').addEventListener('click', () => {
+    const root = $('#settingsTreeRoot');
+    const expanded = root.getAttribute('aria-expanded') !== 'true';
+    root.setAttribute('aria-expanded', String(expanded));
+    root.classList.toggle('expanded', expanded);
+    $('#settingsTreeGroup').hidden = !expanded;
+  });
+
+  $('#routeProvider').addEventListener('change', (event) => {
+    state.settings.provider_id = event.target.value;
+    const provider = currentProvider();
+    state.settings.model = provider?.model || providerModels(provider)[0] || '';
+    changeRoute({ provider_id: state.settings.provider_id, model: state.settings.model });
+  });
+  $('#routeModel').addEventListener('change', (event) => {
+    state.settings.model = event.target.value;
+    changeRoute({ model: state.settings.model });
+  });
+  $('#routeReasoning').addEventListener('change', (event) => {
+    state.settings.reasoning_effort = event.target.value;
+    changeRoute({ reasoning_effort: state.settings.reasoning_effort });
+  });
+
+  $('#providerRows').addEventListener('click', (event) => {
+    const button = event.target.closest('.provider-toggle');
+    if (button) toggleProvider(button.dataset.providerId, button);
+  });
+  $('#reasoningRows').addEventListener('click', (event) => {
+    const button = event.target.closest('.reasoning-choice');
+    if (!button) return;
+    state.settings.reasoning_effort = button.dataset.reasoning;
+    changeRoute({ reasoning_effort: state.settings.reasoning_effort });
+  });
+  $('#includeChineseToggle').addEventListener('click', () => setChinese(!state.settings.include_chinese));
+  $('#outputLanguage').addEventListener('change', (event) => setChinese(event.target.value === 'bilingual'));
+  $('#skillsRows').addEventListener('click', (event) => {
+    const button = event.target.closest('.skill-toggle');
+    if (button) toggleSkill(button.dataset.skillId, button);
+  });
+  $('#skillMode').addEventListener('change', async (event) => {
+    const mode = event.target.value === 'full' ? 'full' : 'compact';
+    state.settings.skill_mode = mode;
+    try { await persistRuntime({ skill_mode: mode }); showToast(mode === 'full' ? '已切换完整技能' : '已切换精简技能'); } catch (error) { showToast(error.message); }
+  });
+}
+
+async function bootstrap() {
+  bindEvents();
+  try {
+    await refreshWorkspace(true);
+  } catch (error) {
+    setServiceStatus(false);
+    state.runError = error.message;
+    setRunMessage(error.message, 'error');
+    renderAll();
+  }
+}
+
+bootstrap();

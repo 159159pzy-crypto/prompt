@@ -1,6 +1,6 @@
-# Anima Prompt Workbench
+# Anima Agent Prompt Studio
 
-本地单用户 Anima Agent 提示词工作台。核心流程是中文自然语言 -> 多组候选 -> Anima 规范化 -> 可拖拽编辑的 Prompt Document。
+本地单用户 Anima 图像提示词生成工作区。用户用中文描述画面，模型返回一到三组结构化正面 Token，并可按相同位置返回精确中文对照。
 
 ## 启动
 
@@ -9,25 +9,47 @@ py -3.11 -m pip install -r requirements.txt
 ./run.ps1
 ```
 
-浏览器打开 `http://127.0.0.1:8191`，端口可通过 `./run.ps1 -Port 8192` 修改。
+打开 `http://127.0.0.1:8191`。首次启动会创建 `data/workbench.sqlite3`。当前版本采用精简 schema，不迁移旧版 Tag/Catalog/翻译数据。
 
-## 功能
+## 工作流
 
-- 左侧 Agent 对话、中间候选提示词、右侧 Prompt Document 三栏工作区
-- Agent 系统提示词、人格、供应商和运行参数集中在设置中心
-- 正/负面提示词 chip 与文本双视图，拖拽排序、双击编辑、权重和删除
-- Anima-safe parser/serializer，保留括号内逗号、LoRA、embedding 和 `BREAK`
-- 固定 Anima 规范化：下划线、score、年份、画师格式、去重和特殊 token 保护
-- 本地 Tag 仓库，支持分类、英文/中文搜索、识别、收藏和插入
-- SQLite 持久化、收藏、JSON/Markdown/Anima 导出
-- OpenAI 兼容供应商配置，以及 Google Cloud Translation 辅助翻译配置
-- Apple-inspired 毛玻璃界面、响应式布局和减少动效支持
+1. 在输出结果页输入自然语言意图并选择一到三个候选。
+2. 在模型与路由中选择已有 OpenAI-compatible 供应商、模型和思考强度。
+3. 在语言设置中决定是否请求逐 Token 中文对照；Skills 默认使用“精简”注入：核心 5 项规则常驻，标签库按请求场景关键词或描述自动匹配，意图中的 `$skill-name` 可强制加载，也可切换“完整”。
+4. 生成后可复制单个或全部英文正面 Prompt，并可从最近对话恢复历史结果。
 
-## 接口
+## Skills（codex 格式）
 
-后端入口是 `backend/app.py`，解析与规范化在 `backend/prompt.py`。主要接口包括 `/api/agent-runs`、`/api/agents`、`/api/settings/tree`、`/api/catalog/tags`、`/api/catalog/recognize`、`/api/prompts/normalize`、`/api/translation/config` 和 `/api/prompts/{id}/export`。
+内置技能以 Codex 兼容格式存放于 `.agents/skills/<name>/SKILL.md`：YAML frontmatter 含 `name`、`display_name`、`description`，正文为指令（参考 learn.chatgpt.com/docs/build-skills.md）。`backend/skills.py` 负责加载与按场景选择，设置页可逐项启停；可向 `.agents/skills` 添加自定义 SKILL.md（重名/缺 SKILL.md 等会在 `GET /api/skills` 的 diagnostics 中报告）。
 
-API key 不会出现在普通列表响应、导出或日志中。当前本地版本使用 SQLite 保存配置，生产化部署应接入 Windows Credential Manager。
+前端按现有配置工作：供应商页只负责启停已有连接，不提供新增、密钥编辑或导入入口。供应商配置 API 与旧 Prompt Document API 继续保留，供兼容或外部工具使用。
+
+没有可用供应商、模型超时或模型返回非法结构时，系统会明确返回失败，不会把中文原文伪装成英文 Prompt。
+思考强度默认关闭以兼容不支持 `reasoning_effort` 的 OpenAI-compatible 路由；支持该参数的模型可在对话栏选择极简、低、中、高或极高。
+供应商设置可单独调整完成 Token 上限，新供应商默认 4096。兼容路由把最终 JSON 放入 `reasoning_content` 时，后端也会提取并校验；只有 `finish_reason=length` 时才提示提高上限。
+
+## API
+
+- `POST /api/generate`
+- `GET /api/workspace`
+- `GET /api/agent-runs`
+- `GET /api/skills`
+- `PUT /api/skills/{skill_id}`
+- `GET/POST/PATCH /api/documents`
+- `GET /api/documents/{id}/versions`
+- `POST /api/documents/{id}/restore`
+- `POST /api/documents/{id}/validate`
+- `POST /api/documents/{id}/export`
+- `GET/POST/PUT/DELETE /api/providers`
+- `POST /api/providers/import`
+- `GET /api/providers/{id}/models`
+- `POST /api/providers/{id}/models/sync`
+- `GET/PUT /api/settings/{key}`
+- `GET /api/status`
+
+`POST /api/generate` 的新候选只返回 `positive_tokens`，中文模式另返回等长同序的 `positive_translations`。旧文档中的 `negative_tokens` 字段不迁移、不删除，文档读取、版本和导出保持兼容。
+
+文档 lint 会检查重复 Token、数量互斥、§13.6 禁令词；保存接口保持短文档兼容，`POST /api/documents/{id}/validate` 额外检查场景数量档位（单人 16-30、双人 22-38、复杂 30-48）。
 
 ## 验证
 
@@ -35,4 +57,5 @@ API key 不会出现在普通列表响应、导出或日志中。当前本地版
 py -3.11 -m pytest -q
 py -3.11 -m compileall -q backend
 node --check static/app.js
+git diff --check
 ```
