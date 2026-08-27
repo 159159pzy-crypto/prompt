@@ -56,6 +56,10 @@
               <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M4 12h16M12 4c2 2.2 3 4.9 3 8s-1 5.8-3 8c-2-2.2-3-4.9-3-8s1-5.8 3-8Z"/></svg>
               语言与翻译
             </button>
+            <button class="tree-item" type="button" data-view="system">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5z"/><path d="M8 9h8M8 13h5"/></svg>
+              系统提示词
+            </button>
             <button class="tree-item" type="button" data-view="skills">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.2 5.1L20 10l-4.1 3.7L17 19l-5-2.8L7 19l1.1-5.3L4 10l5.8-1.9L12 3Z"/></svg>
               Skills
@@ -92,7 +96,7 @@
               </div>
             </div>
 
-            <div class="run-message" id="runMessage" role="status" hidden></div>
+            <div class="run-message" id="runMessage" role="status" hidden><span id="runMessageText"></span><button class="copy-link" id="cancelRun" type="button" hidden>取消</button><button class="copy-link" id="retryRun" type="button" hidden>重试</button></div>
             <div class="result-head">
               <div><h2>生成结果</h2><span class="result-meta" id="resultMeta">等待输入画面描述</span></div>
               <div class="result-actions"><label class="sr-only" for="versionSelect">历史版本</label><select class="version-select" id="versionSelect" hidden></select><button class="copy-link copy-all" id="copyAll" type="button" hidden>复制全部英文</button></div>
@@ -152,6 +156,19 @@
             </div>
           </section>
 
+          <section class="view settings-view" data-view-panel="system" hidden>
+            <p class="eyebrow">SYSTEM PROMPT</p>
+            <h2>系统提示词</h2>
+            <p class="settings-intro">自定义规则会在项目默认人格和结构化输出约束之前注入。不要放入 API key 或其它敏感信息。</p>
+            <div class="setting-panel">
+              <label class="setting-row system-prompt-row" for="systemPromptInput">
+                <span><strong>自定义提示词</strong><small>最多 12,000 个字符；留空则使用默认系统提示词。</small></span>
+                <textarea class="system-prompt-input" id="systemPromptInput" maxlength="12000" rows="12" placeholder="例如：保持冷色、避免加入未要求的角色设定。"></textarea>
+              </label>
+              <div class="settings-actions"><button class="copy-link" id="systemPromptReset" type="button">清空</button><button class="generate" id="systemPromptSave" type="button"><span>保存提示词</span><span aria-hidden="true">✓</span></button></div>
+            </div>
+          </section>
+
           <section class="view settings-view" data-view-panel="skills" hidden>
             <p class="eyebrow">SKILLS</p>
             <h2>Skills</h2>
@@ -167,6 +184,6 @@
     </div>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="/static/app.js"></script>
+  <script type="module" src="/static/app.js?v=20260827-4"></script>
 </body>
 </html>

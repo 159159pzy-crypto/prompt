@@ -242,6 +242,7 @@ def _parse_model_json(content: str) -> dict[str, Any]:
 MAX_TOOL_RESULT_CHARS = 12000
 MAX_AGENT_ROUNDS = 16
 AGENT_TIMEOUT_SECONDS = 300
+MAX_TOOL_CALLS = 32
 
 
 def _clip(value: Any, limit: int = MAX_TOOL_RESULT_CHARS) -> Any:
@@ -268,7 +269,7 @@ def _tool_list_skills() -> dict[str, Any]:
     return {"items": _clip(items), "diagnostics": _clip(diagnostics)}
 
 
-def _tool_read_skill(arguments: dict[str, Any]) -> dict[str, Any]:
+def _tool_read_skill(arguments: dict[str, Any], injected_skill_ids: set[str] | None = None) -> dict[str, Any]:
     skill_id = str(arguments.get("skill_id") or "").strip()
     if not skill_id:
         raise ValueError("skill_id is required")
@@ -276,7 +277,10 @@ def _tool_read_skill(arguments: dict[str, Any]) -> dict[str, Any]:
     skill = next((item for item in discovered if item.id == skill_id), None)
     if skill is None:
         raise ValueError(f"unknown skill: {skill_id}")
-    return {"id": skill.id, "name": skill.display_name or skill.name, "description": skill.description, "instruction": _clip(skill_runtime.load_instructions(skill))}
+    item = {"id": skill.id, "name": skill.display_name or skill.name, "description": skill.description}
+    if injected_skill_ids and skill.id in injected_skill_ids:
+        return {**item, "instruction_injected": True, "instruction": "该 Skill 已注入当前 system message，无需重复读取。"}
+    return {**item, "instruction_injected": False, "instruction": _clip(skill_runtime.load_instructions(skill))}
 
 
 def _tool_validate_prompt(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -296,11 +300,11 @@ def _tool_normalize_prompt(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"document": _clip(document), "protected_tokens": document.get("protected_tokens", [])}
 
 
-def _execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def _execute_tool(name: str, arguments: dict[str, Any], injected_skill_ids: set[str] | None = None) -> dict[str, Any]:
     if name == "list_skills":
         return _tool_list_skills()
     if name == "read_skill":
-        return _tool_read_skill(arguments)
+        return _tool_read_skill(arguments, injected_skill_ids)
     if name == "validate_prompt":
         return _tool_validate_prompt(arguments)
     if name == "normalize_prompt":
@@ -343,7 +347,10 @@ def validate_variant(raw: dict[str, Any], include_chinese: bool) -> dict[str, An
     # Final model output always passes through the same deterministic tool semantics.
     normalized = _tool_normalize_prompt({"document": document})["document"]
     document = normalized
-    issues = _tool_validate_prompt({"document": document, "enforce_quantity": True})["issues"]
+    # Keep response validation structural; quantity bands are enforced by the
+    # explicit document validation endpoint and by the runtime when a request
+    # declares a concrete scene-count contract.
+    issues = _tool_validate_prompt({"document": document, "enforce_quantity": False})["issues"]
     if issues:
         raise ValueError("; ".join(issue["message"] for issue in issues))
     if include_chinese:
@@ -417,13 +424,14 @@ async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "
         system += TRANSLATION_RULE + "\n"
     skill_state = {**(enabled_skills if isinstance(enabled_skills, dict) else {}), "__mode": "compact", "__intent": body.intent, "__requested_count": requested_count, "__variation_dimensions": variation_dimensions, "__dedupe_required": dedupe_required}
     actual_skill_ids = selected_skill_ids(skill_state)
+    injected_skill_ids = set(actual_skill_ids)
     if enabled_skills:
         rendered = skill_instructions(skill_state)
         if rendered:
             system += "\nApply these selected repository Skills for this request:\n" + "\n\n".join(rendered) + "\n"
     if dedupe_required:
         system += "\nThis request requires distinct variants. Vary the requested semantic dimensions and avoid repeating core tags across variants; do not collapse variants into one.\n"
-    system += "\nYou may call read-only tools when useful. Always return final JSON with variants after tool work.\n"
+    system += "\nSelected Skill instructions are already present above. Do not call read_skill for an injected Skill unless you need to verify its metadata. You may call other read-only tools when useful. Always return final JSON with variants after tool work.\n"
     system += f"Return this shape: {json.dumps(schema, ensure_ascii=False)}"
     selected_model = body.model or provider["model"]
     completion_limit = int(provider["max_tokens"])
@@ -451,6 +459,7 @@ async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "
     last_usage: dict[str, Any] = {}
     messages = request["messages"]
     trace: list[dict[str, Any]] = []
+    tool_call_count = 0
     def emit(event: dict[str, Any]) -> None:
         trace.append(event)
         if event_sink:
@@ -462,7 +471,14 @@ async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "
                 if time.perf_counter() >= deadline:
                     raise ModelResponseError("agent_timeout", "Agent 执行超过 300 秒。")
                 request["messages"] = messages
-                emit({"event_type": "model_request", "round": round_index + 1})
+                emit({
+                    "event_type": "model_request",
+                    "round": round_index + 1,
+                    "model": selected_model,
+                    "message_count": len(messages),
+                    "system_prompt_chars": len(str(messages[0].get("content") or "")) if messages else 0,
+                    "tool_count": len(trace),
+                })
                 remaining = max(0.1, deadline - time.perf_counter())
                 response = await asyncio.wait_for(client.post(provider["base_url"].rstrip("/") + "/chat/completions", json=request, headers={"Authorization": f"Bearer {secret}"}), timeout=remaining)
                 response.raise_for_status()
@@ -474,9 +490,12 @@ async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "
                 if calls:
                     messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": message.get("tool_calls")})
                     for call in calls:
+                        tool_call_count += 1
+                        if tool_call_count > MAX_TOOL_CALLS:
+                            raise ModelResponseError("tool_call_limit", f"Agent 超过单次 Run 工具调用上限 {MAX_TOOL_CALLS}。")
                         started_tool = time.perf_counter()
                         try:
-                            result = _execute_tool(call["name"], call["arguments"])
+                            result = _execute_tool(call["name"], call["arguments"], injected_skill_ids)
                             tool_payload = {"ok": True, "result": _clip(result)}
                             event_status = "completed"
                         except (TypeError, ValueError, KeyError) as exc:

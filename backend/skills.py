@@ -86,6 +86,9 @@ def _requested_skill_ids(value: Any) -> set[str]:
     requested_dimensions = value.get("__variation_dimensions") if isinstance(value, dict) else []
     if isinstance(requested_dimensions, (list, tuple, set)):
         selected.update(str(item) for item in requested_dimensions)
+    explicit_ids = value.get("__explicit_skill_ids") if isinstance(value, dict) else []
+    if isinstance(explicit_ids, (list, tuple, set)):
+        selected.update(str(item) for item in explicit_ids)
     for skill_id, hints in SCENARIO_SKILL_HINTS.items():
         if any(str(hint).casefold() in lowered for hint in hints):
             selected.add(skill_id)
@@ -106,7 +109,7 @@ def selected(value: Any) -> list[dict[str, Any]]:
         requested = _requested_skill_ids(value)
         items = [
             item for item in definitions()
-            if item["id"] in requested and (enabled[item["id"]] or item["id"] in CORE_SKILL_IDS or item["id"] in requested)
+            if item["id"] in requested and (enabled[item["id"]] or item["id"] in CORE_SKILL_IDS)
         ]
     else:
         items = [

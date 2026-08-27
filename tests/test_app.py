@@ -1,5 +1,7 @@
 import json
 from contextlib import contextmanager
+import json
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -9,6 +11,7 @@ from backend.app import app
 from backend.documents import validate_document
 from backend.skills import instructions
 from backend import skill_runtime
+from backend import run_store, worker
 
 
 @contextmanager
@@ -21,7 +24,7 @@ def client_for(tmp_path, monkeypatch):
 
 def test_fresh_schema_contains_only_core_tables(tmp_path, monkeypatch):
     with client_for(tmp_path, monkeypatch) as client:
-        assert client.get("/api/status").json()["schema_version"] == 3
+        assert client.get("/api/status").json()["schema_version"] == 4
         tables = {row[0] for row in db.connect().execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert tables == {"schema_meta", "prompt_documents", "prompt_versions", "agent_runs", "agent_events", "providers", "settings"}
 
@@ -138,6 +141,60 @@ def test_workspace_snapshot_matches_agent_studio_frontend(tmp_path, monkeypatch)
         assert body["providers"] == []
         assert body["recent_runs"] == []
         assert any(item["id"] == "anima-tags" for item in body["skills"])
+
+
+def test_durable_run_idempotency_single_active_and_cancel(tmp_path, monkeypatch):
+    with client_for(tmp_path, monkeypatch) as client:
+        first = client.post("/api/runs", json={"intent": "雨夜女孩", "idempotency_key": "same-key"})
+        assert first.status_code == 202
+        run_id = first.json()["run_id"]
+        duplicate = client.post("/api/runs", json={"intent": "雨夜女孩", "idempotency_key": "same-key"})
+        assert duplicate.status_code == 202
+        assert duplicate.json()["run_id"] == run_id
+        conflict = client.post("/api/runs", json={"intent": "另一条", "conversation_id": first.json()["conversation_id"]})
+        assert conflict.status_code == 409
+        cancelled = client.post(f"/api/runs/{run_id}/cancel")
+        assert cancelled.json()["status"] == "cancelled"
+        status = client.get(f"/api/runs/{run_id}").json()
+        assert status["status"] == "cancelled"
+
+
+def test_run_events_are_incremental(tmp_path, monkeypatch):
+    with client_for(tmp_path, monkeypatch) as client:
+        created = client.post("/api/runs", json={"intent": "雨夜女孩", "idempotency_key": "events-key"}).json()
+        run_store.append_event(created["run_id"], {"event_type": "stage", "stage": "planner", "status": "completed"})
+        run_store.append_event(created["run_id"], {"event_type": "stage", "stage": "generator", "status": "running"})
+        all_events = client.get(f"/api/runs/{created['run_id']}/events").json()["items"]
+        assert [item["sequence"] for item in all_events] == [1, 2]
+        assert [item["stage"] for item in all_events] == ["planner", "generator"]
+        assert len(client.get(f"/api/runs/{created['run_id']}/events?after=1").json()["items"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_executes_queued_run_and_persists_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANIMA_TEST_KEY", "test-only")
+    with client_for(tmp_path, monkeypatch) as client:
+        provider = client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test", "env_name": "ANIMA_TEST_KEY"}).json()
+        created = client.post("/api/runs", json={"intent": "雨夜女孩", "provider_id": provider["id"], "model": "test", "idempotency_key": "worker-key"}).json()
+
+        class FakeClient:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return None
+            async def post(self, *_args, **_kwargs):
+                payload = {"choices": [{"message": {"content": json.dumps({"variants": [{"positive_tokens": ["1girl", "rain"]}]}, ensure_ascii=False), "tool_calls": []}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 2, "completion_tokens": 4}}
+                class Response:
+                    def raise_for_status(self): return None
+                    def json(self): return payload
+                return Response()
+
+        monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **_kwargs: FakeClient())
+        claimed = run_store.claim_next("test-worker")
+        assert claimed["id"] == created["run_id"]
+        await worker.execute_run(claimed, "test-worker")
+        status = client.get(f"/api/runs/{created['run_id']}").json()
+        assert status["status"] == "completed"
+        assert status["result"]["variants"][0]["positive_tokens"][0]["raw_text"] == "1girl"
+        assert len(client.get(f"/api/runs/{created['run_id']}/events").json()["items"]) >= 4
 
 
 def document_payload():
@@ -618,6 +675,17 @@ def test_codex_skill_body_is_loaded_only_when_selected(tmp_path, monkeypatch):
     assert all("OTHER BODY" not in item for item in rendered)
 
 
+def test_injected_skill_read_returns_compact_metadata(tmp_path, monkeypatch):
+    write_codex_skill(tmp_path, name="demo", description="Rain workflow", body="RAIN BODY")
+    monkeypatch.setattr(skill_runtime, "REPO_ROOT", tmp_path)
+
+    result = agent._tool_read_skill({"skill_id": "demo"}, {"demo"})
+
+    assert result["instruction_injected"] is True
+    assert "RAIN BODY" not in result["instruction"]
+    assert "已注入" in result["instruction"]
+
+
 def test_codex_skill_api_toggle_and_generation_selection(tmp_path, monkeypatch):
     write_codex_skill(tmp_path, description="Rain workflow", body="RAIN BODY")
     monkeypatch.setattr(skill_runtime, "REPO_ROOT", tmp_path)
@@ -642,3 +710,21 @@ def test_codex_skill_api_toggle_and_generation_selection(tmp_path, monkeypatch):
         assert captured["intent"] == "rain scene"
         assert captured["enabled_skills"]["__intent"] == "rain scene"
         assert captured["enabled_skills"]["demo"] is True
+
+
+def test_explicit_skill_marker_survives_run_queue_and_worker_payload(tmp_path, monkeypatch):
+    write_codex_skill(tmp_path, name="special", description="Unrelated trigger", body="SPECIAL BODY")
+    monkeypatch.setattr(skill_runtime, "REPO_ROOT", tmp_path)
+    with client_for(tmp_path, monkeypatch) as client:
+        created = client.post("/api/runs", json={"intent": "普通描述 $special", "idempotency_key": "explicit-run"})
+        assert created.status_code == 202
+        run = run_store.get_run(created.json()["run_id"])
+        assert run["request"]["current_document"]["_explicit_skill_ids"] == ["special"]
+        payload = worker._request_body(run["request"])
+        assert payload.current_document["_explicit_skill_ids"] == ["special"]
+
+
+def test_disabled_non_core_skill_is_not_injected_even_when_requested():
+    state = {"__mode": "compact", "__intent": "雨夜制服", "clothing-library": False}
+    selected = instructions(state)
+    assert not any("服装与状态标签库" in item for item in selected)

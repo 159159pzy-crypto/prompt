@@ -16,6 +16,7 @@ const VIEW_TITLES = {
   provider: '供应商',
   reasoning: '思考强度',
   language: '语言与翻译',
+  system: '系统提示词',
   skills: 'Skills',
 };
 
@@ -25,6 +26,7 @@ const state = {
     provider_id: '',
     model: '',
     reasoning_effort: 'none',
+    system_prompt: '',
   },
   providers: [],
   skills: [],
@@ -36,6 +38,7 @@ const state = {
   activeIntent: '',
   runError: '',
   busy: false,
+  idempotencyKey: '',
 };
 
 async function api(path, options = {}) {
@@ -86,7 +89,7 @@ function setServiceStatus(online, text = '') {
 function setRunMessage(message = '', tone = '') {
   const target = $('#runMessage');
   target.hidden = !message;
-  target.textContent = message;
+  $('#runMessageText').textContent = message;
   target.className = `run-message ${tone}`.trim();
 }
 
@@ -247,13 +250,21 @@ function renderLanguage() {
   $('#outputLanguage').value = enabled ? 'bilingual' : 'english';
 }
 
+function renderSystemPrompt() {
+  const input = $('#systemPromptInput');
+  if (input && document.activeElement !== input) input.value = state.settings.system_prompt || '';
+}
+
 function renderSkills() {
   const target = $('#skillsRows');
   if (!state.skills.length) {
     target.innerHTML = '<div class="settings-empty">没有可用 Skills。</div>';
     return;
   }
-  target.innerHTML = state.skills.map((skill) => `<div class="setting-row"><span><strong>${escapeHtml(skill.name)}</strong><small>${escapeHtml(skill.description)}</small></span><span class="toggle on" aria-label="Agent 可调用" role="img"></span></div>`).join('');
+  target.innerHTML = state.skills.map((skill) => {
+    const enabled = skill.enabled !== false;
+    return `<div class="setting-row"><span><strong>${escapeHtml(skill.name)}</strong><small>${escapeHtml(skill.description)}</small></span><button class="toggle skill-toggle ${enabled ? 'on' : ''}" type="button" role="switch" aria-checked="${enabled}" aria-label="${enabled ? '停用' : '启用'} ${escapeHtml(skill.name)}" data-skill-id="${escapeHtml(skill.id)}"></button></div>`;
+  }).join('');
   const mode = $('#skillMode');
   if (mode) { mode.value = 'agent'; mode.disabled = true; }
 }
@@ -266,6 +277,7 @@ function renderAll() {
   renderProviders();
   renderReasoning();
   renderLanguage();
+  renderSystemPrompt();
   renderSkills();
   $('#conversationTitle').textContent = state.activeIntent || '新对话';
 }
@@ -357,6 +369,21 @@ async function loadRuns(selectLatest = false) {
   else renderRuns();
 }
 
+async function waitForRun(runId) {
+  let delay = 350;
+  for (let attempt = 0; attempt < 1200; attempt += 1) {
+    const run = await api(`/api/runs/${encodeURIComponent(runId)}`, { timeout: 10000 });
+    $('#cancelRun').hidden = !['queued', 'running'].includes(run.status);
+    $('#retryRun').hidden = !['failed', 'cancelled'].includes(run.status);
+    if (run.status === 'completed') return run.result || run;
+    if (run.status === 'failed' || run.status === 'cancelled') return { ...run.result, status: run.status, error: run.error };
+    setRunMessage(`${run.stage || 'queued'} · ${Number(run.progress || 0)}%`);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay = Math.min(2500, Math.round(delay * 1.12));
+  }
+  throw new Error('Run 轮询超时，请稍后从历史记录恢复');
+}
+
 async function generate() {
   const intent = $('#intentInput').value.trim();
   if (!intent) {
@@ -373,6 +400,7 @@ async function generate() {
 
   state.busy = true;
   const modifying = Boolean(state.activeConversationId && state.activeRunId && state.variants.length);
+  state.idempotencyKey = state.idempotencyKey || `${modifying ? state.activeRunId : 'new'}:${Date.now()}`;
   const originalIntent = state.activeIntent || intent;
   const baseVariants = modifying ? state.variants : [];
   if (!modifying) state.activeIntent = intent;
@@ -385,7 +413,7 @@ async function generate() {
   if (modifying) $('#conversationTitle').textContent = originalIntent;
 
   try {
-    const result = await api('/api/generate', {
+    const created = await api('/api/runs', {
       method: 'POST',
       body: JSON.stringify({
         intent,
@@ -397,8 +425,11 @@ async function generate() {
         provider_id: provider.id,
         model: state.settings.model,
         reasoning_effort: state.settings.reasoning_effort || 'none',
+        idempotency_key: state.idempotencyKey,
       }),
     });
+    state.activeRunId = created.run_id || created.id || '';
+    const result = await waitForRun(state.activeRunId);
     if (result.status === 'completed') {
       state.activeRunId = result.id || '';
       state.activeConversationId = result.conversation_id || state.activeConversationId || result.id || '';
@@ -422,12 +453,14 @@ async function generate() {
     }
     await loadRuns(false);
     renderVersions();
+    state.idempotencyKey = '';
   } catch (error) {
     state.runError = error.message;
     setRunMessage(error.message, 'error');
     showToast(error.message);
   } finally {
     state.busy = false;
+    $('#cancelRun').hidden = true;
     renderResults();
     renderRouteControls();
   }
@@ -533,6 +566,26 @@ function bindEvents() {
   });
   $('#newChat').addEventListener('click', newChat);
   $('#generateButton').addEventListener('click', generate);
+  $('#skillsRows').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-skill-id]');
+    if (button) toggleSkill(button.dataset.skillId, button);
+  });
+  $('#cancelRun').addEventListener('click', async () => {
+    if (!state.activeRunId) return;
+    try { await api(`/api/runs/${encodeURIComponent(state.activeRunId)}/cancel`, { method: 'POST' }); showToast('已请求取消'); }
+    catch (error) { showToast(error.message); }
+  });
+  $('#retryRun').addEventListener('click', async () => {
+    if (!state.activeRunId) return;
+    try {
+      const created = await api(`/api/runs/${encodeURIComponent(state.activeRunId)}/retry`, { method: 'POST' });
+      state.activeRunId = created.run_id || created.id;
+      const result = await waitForRun(state.activeRunId);
+      if (result.status === 'completed') { state.variants = result.variants || result.result?.variants || []; renderResults(); showToast('重试完成'); }
+      else showToast(result.error?.message || '重试失败');
+      await loadRuns(false);
+    } catch (error) { showToast(error.message); }
+  });
   $('#intentInput').addEventListener('keydown', (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') generate();
   });
@@ -588,6 +641,18 @@ function bindEvents() {
   });
   $('#includeChineseToggle').addEventListener('click', () => setChinese(!state.settings.include_chinese));
   $('#outputLanguage').addEventListener('change', (event) => setChinese(event.target.value === 'bilingual'));
+  $('#systemPromptSave').addEventListener('click', async () => {
+    const input = $('#systemPromptInput');
+    try {
+      await persistRuntime({ system_prompt: input.value.slice(0, 12000) });
+      renderSystemPrompt();
+      showToast('系统提示词已保存');
+    } catch (error) { showToast(error.message); }
+  });
+  $('#systemPromptReset').addEventListener('click', () => {
+    $('#systemPromptInput').value = '';
+    showToast('已清空自定义提示词，保存后使用默认规则');
+  });
 }
 
 async function bootstrap() {

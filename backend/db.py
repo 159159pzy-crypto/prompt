@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 DB_PATH = DATA / "workbench.sqlite3"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def now() -> str:
@@ -30,6 +30,12 @@ def row_json(row: sqlite3.Row | None) -> dict:
 
 
 def _create_schema(db: sqlite3.Connection) -> None:
+    has_meta = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'").fetchone()
+    existing_version = db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone() if has_meta else None
+    if existing_version and int(existing_version[0] or 0) < 4:
+        # Runtime history is intentionally rebuilt for the durable Run model.
+        db.execute("DROP TABLE IF EXISTS agent_events")
+        db.execute("DROP TABLE IF EXISTS agent_runs")
     db.executescript(
         """
         CREATE TABLE IF NOT EXISTS schema_meta (
@@ -81,6 +87,8 @@ def _create_schema(db: sqlite3.Connection) -> None:
             latency_ms INTEGER,
             error_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL,
+            step_id TEXT NOT NULL DEFAULT '',
+            attempt INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_agent_events_run ON agent_events(run_id, sequence);
@@ -113,6 +121,26 @@ def _create_schema(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE agent_runs ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
     if "mode" not in run_columns:
         db.execute("ALTER TABLE agent_runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'create'")
+    for column, definition in {
+        "stage": "TEXT NOT NULL DEFAULT 'queued'",
+        "idempotency_key": "TEXT NOT NULL DEFAULT ''",
+        "attempt": "INTEGER NOT NULL DEFAULT 0",
+        "lease_owner": "TEXT NOT NULL DEFAULT ''",
+        "lease_expires_at": "TEXT NOT NULL DEFAULT ''",
+        "heartbeat_at": "TEXT NOT NULL DEFAULT ''",
+        "started_at": "TEXT NOT NULL DEFAULT ''",
+        "finished_at": "TEXT NOT NULL DEFAULT ''",
+        "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+        "progress": "INTEGER NOT NULL DEFAULT 0",
+        "usage_json": "TEXT NOT NULL DEFAULT '{}'",
+    }.items():
+        if column not in run_columns:
+            db.execute(f"ALTER TABLE agent_runs ADD COLUMN {column} {definition}")
+    event_columns = {row["name"] for row in db.execute("PRAGMA table_info(agent_events)")}
+    if "step_id" not in event_columns:
+        db.execute("ALTER TABLE agent_events ADD COLUMN step_id TEXT NOT NULL DEFAULT ''")
+    if "attempt" not in event_columns:
+        db.execute("ALTER TABLE agent_events ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0")
     db.execute("UPDATE agent_runs SET conversation_id=id WHERE conversation_id='' OR conversation_id IS NULL")
 
     columns = {row["name"] for row in db.execute("PRAGMA table_info(providers)")}
@@ -124,6 +152,9 @@ def _create_schema(db: sqlite3.Connection) -> None:
         "INSERT OR REPLACE INTO schema_meta(key,value) VALUES('version',?)",
         (str(SCHEMA_VERSION),),
     )
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_runs_idempotency ON agent_runs(idempotency_key) WHERE idempotency_key <> ''")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_agent_runs_queue ON agent_runs(status, lease_expires_at, created_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_agent_runs_conversation ON agent_runs(conversation_id, revision)")
 
 
 def _seed(db: sqlite3.Connection) -> None:

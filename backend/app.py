@@ -17,8 +17,10 @@ from .agent import generate as generate_agent, parse_generation_request
 from .db import DB_PATH, SCHEMA_VERSION, connect, init_db, now, row_json
 from .documents import canonical_document, document_view as _document_view, export_document as _export_document, json_value as _json, snapshot as _snapshot, validate_document, write_document as _write_document
 from .secrets import delete_secret, get_secret, put_secret
+from . import skill_runtime
 from .skill_runtime import strip_explicit_markers
 from .skills import catalog as skill_catalog, discovery_diagnostics
+from .run_store import ACTIVE, TERMINAL, append_event, cancel_run as cancel_stored_run, create_run, decode_run, get_run, list_events
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -82,6 +84,7 @@ class GenerateIn(BaseModel):
     provider_id: str = ""
     model: str = ""
     reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] = "none"
+    idempotency_key: str = ""
 
     @field_validator("intent")
     @classmethod
@@ -221,7 +224,9 @@ def status() -> dict[str, Any]:
     with connect() as db:
         documents = db.execute("SELECT COUNT(*) FROM prompt_documents").fetchone()[0]
         provider = db.execute("SELECT COUNT(*) FROM providers WHERE enabled=1").fetchone()[0]
-    return {"ok": True, "name": app.title, "version": app.version, "schema_version": SCHEMA_VERSION, "documents": documents, "enabled_providers": provider, "database": str(DB_PATH)}
+        queued = db.execute("SELECT COUNT(*) FROM agent_runs WHERE status='queued'").fetchone()[0]
+        running = db.execute("SELECT COUNT(*) FROM agent_runs WHERE status='running'").fetchone()[0]
+    return {"ok": True, "name": app.title, "version": app.version, "schema_version": SCHEMA_VERSION, "documents": documents, "enabled_providers": provider, "queued_runs": queued, "running_runs": running, "database": str(DB_PATH)}
 
 
 @app.get("/api/settings")
@@ -355,6 +360,90 @@ async def test_provider(provider_id: str) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
+def _prepare_run_body(body: GenerateIn) -> tuple[GenerateIn, str, str, int]:
+    runtime = _runtime_settings()
+    activation = skill_runtime.activate(body.intent, runtime.get("skills") or {})
+    request_intent = strip_explicit_markers(body.intent)
+    original_intent = request_intent
+    if body.mode == "modify":
+        if not body.conversation_id or not body.parent_run_id:
+            raise HTTPException(400, "修改当前对话需要 conversation_id 和 parent_run_id")
+        with connect() as db:
+            parent = db.execute("SELECT * FROM agent_runs WHERE id=? AND conversation_id=?", (body.parent_run_id, body.conversation_id)).fetchone()
+        if not parent:
+            raise HTTPException(400, "当前对话版本不存在，请刷新后重试")
+        original_intent = parent["intent"]
+        current = dict(body.current_document or {})
+        current.setdefault("original_intent", original_intent)
+        current["modification_request"] = request_intent
+        body = body.model_copy(update={"intent": original_intent, "current_document": current})
+    else:
+        body = body.model_copy(update={"intent": request_intent})
+    provider_id = body.provider_id or str(runtime.get("provider_id") or "")
+    provider = _provider(provider_id)
+    if provider_id and not provider:
+        raise HTTPException(400, "所选供应商不存在或已停用")
+    if not body.model:
+        runtime_model = runtime.get("model") if provider_id and provider_id == runtime.get("provider_id") else ""
+        body = body.model_copy(update={"model": str(runtime_model or (provider["model"] if provider else ""))})
+    conversation_id = body.conversation_id or str(uuid.uuid4())
+    with connect() as db:
+        latest = db.execute("SELECT COALESCE(MAX(revision),0) AS revision FROM agent_runs WHERE conversation_id=?", (conversation_id,)).fetchone()["revision"]
+    body = body.model_copy(update={"current_document": {**(body.current_document or {}), "_explicit_skill_ids": activation["selected_skill_ids"]}})
+    return body, original_intent, conversation_id, int(latest) + 1
+
+
+@app.post("/api/runs", status_code=202)
+async def create_agent_run(body: GenerateIn) -> dict[str, Any]:
+    body, original_intent, conversation_id, revision = _prepare_run_body(body)
+    run_id = str(uuid.uuid4())
+    try:
+        run = create_run(run_id=run_id, request=body.model_dump(), intent=original_intent, conversation_id=conversation_id, parent_run_id=body.parent_run_id, revision=revision, mode=body.mode, idempotency_key=body.idempotency_key.strip()[:200])
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"run_id": run["id"], "id": run["id"], "status": run["status"], "stage": run.get("stage", "queued"), "conversation_id": run["conversation_id"], "revision": run["revision"]}
+
+
+@app.get("/api/runs/{run_id}")
+def get_agent_run(run_id: str) -> dict[str, Any]:
+    run = get_run(run_id)
+    if not run:
+        raise HTTPException(404, "run not found")
+    response = run.get("response") if isinstance(run.get("response"), dict) else {}
+    return {"run_id": run_id, "id": run_id, "status": run["status"], "stage": run.get("stage", ""), "progress": run.get("progress", 0), "conversation_id": run.get("conversation_id", ""), "revision": run.get("revision", 1), "parent_run_id": run.get("parent_run_id", ""), "result": response, "error": run.get("error") or None, "usage": run.get("usage") or {}, "attempt": run.get("attempt", 0), "cancel_requested": run.get("cancel_requested", False), "created_at": run.get("created_at"), "started_at": run.get("started_at"), "finished_at": run.get("finished_at")}
+
+
+@app.get("/api/runs/{run_id}/events")
+def get_agent_run_events(run_id: str, after: int = Query(0, ge=0)) -> dict[str, Any]:
+    if not get_run(run_id):
+        raise HTTPException(404, "run not found")
+    return {"items": list_events(run_id, after=after)}
+
+
+@app.post("/api/runs/{run_id}/cancel")
+def cancel_agent_run(run_id: str) -> dict[str, Any]:
+    if not get_run(run_id):
+        raise HTTPException(404, "run not found")
+    run = cancel_stored_run(run_id)
+    return {"run_id": run_id, "status": run.get("status"), "cancel_requested": run.get("cancel_requested", False)}
+
+
+@app.post("/api/runs/{run_id}/retry", status_code=202)
+async def retry_agent_run(run_id: str) -> dict[str, Any]:
+    original = get_run(run_id)
+    if not original:
+        raise HTTPException(404, "run not found")
+    if original.get("status") not in TERMINAL:
+        raise HTTPException(409, "只有已结束的 Run 才能重试")
+    payload = dict(original.get("request") or {})
+    payload["idempotency_key"] = str(uuid.uuid4())
+    payload["parent_run_id"] = run_id
+    body = GenerateIn.model_validate(payload)
+    body, intent, conversation_id, revision = _prepare_run_body(body.model_copy(update={"conversation_id": original.get("conversation_id", "")}))
+    run = create_run(run_id=str(uuid.uuid4()), request=body.model_dump(), intent=intent, conversation_id=conversation_id, parent_run_id=run_id, revision=revision, mode=body.mode, idempotency_key=payload["idempotency_key"])
+    return {"run_id": run["id"], "id": run["id"], "status": run["status"], "conversation_id": run["conversation_id"], "revision": run["revision"], "parent_run_id": run_id}
+
+
 @app.post("/api/generate")
 async def generate(body: GenerateIn) -> dict[str, Any]:
     runtime = _runtime_settings()
@@ -394,6 +483,8 @@ async def generate(body: GenerateIn) -> dict[str, Any]:
     capability_state["__requested_count"] = parsed_request["requested_count"]
     capability_state["__variation_dimensions"] = parsed_request["variation_dimensions"]
     capability_state["__dedupe_required"] = parsed_request["dedupe_required"]
+    activation = skill_runtime.activate(body.intent, runtime.get("skills") or {})
+    capability_state["__explicit_skill_ids"] = activation["selected_skill_ids"]
     capability_state["__selected_skill_ids"] = []
     from .skills import selected_ids
     capability_state["__selected_skill_ids"] = selected_ids(capability_state)
@@ -410,8 +501,8 @@ async def generate(body: GenerateIn) -> dict[str, Any]:
         db.execute("INSERT INTO agent_runs (id,intent,request_json,response_json,status,error_json,engine,latency_ms,created_at,conversation_id,parent_run_id,revision,mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (run_id, original_intent, body.model_dump_json(), json.dumps(response, ensure_ascii=False), result["status"], json.dumps(result.get("error") or {}, ensure_ascii=False), result["engine"], result.get("latency_ms"), now(), conversation_id, body.parent_run_id, revision, body.mode))
         for sequence, event in enumerate(tool_trace, 1):
             db.execute(
-                "INSERT INTO agent_events VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), run_id, sequence, str(event.get("event_type") or ""), str(event.get("tool_name") or ""), json.dumps(event.get("arguments") or {}, ensure_ascii=False), json.dumps(event.get("result") or {}, ensure_ascii=False), str(event.get("status") or ""), event.get("latency_ms"), json.dumps(event.get("error") or {}, ensure_ascii=False), now()),
+                "INSERT INTO agent_events (id,run_id,sequence,event_type,tool_name,arguments_json,result_json,status,latency_ms,error_json,created_at,step_id,attempt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), run_id, sequence, str(event.get("event_type") or ""), str(event.get("tool_name") or ""), json.dumps(event.get("arguments") or {}, ensure_ascii=False), json.dumps(event.get("result") or {}, ensure_ascii=False), str(event.get("status") or ""), event.get("latency_ms"), json.dumps(event.get("error") or {}, ensure_ascii=False), now(), str(event.get("step_id") or event.get("stage") or ""), int(event.get("attempt") or 0)),
             )
     return response
 
@@ -435,7 +526,7 @@ def agent_run_trace(run_id: str) -> dict[str, Any]:
         if not run:
             raise HTTPException(404, "agent run not found")
         rows = db.execute("SELECT * FROM agent_events WHERE run_id=? ORDER BY sequence", (run_id,)).fetchall()
-    return {"run_id": run_id, "items": [{**row_json(row), "arguments": _json(row["arguments_json"], {}), "result": _json(row["result_json"], {}), "error": _json(row["error_json"], {})} for row in rows]}
+    return {"run_id": run_id, "items": [{**row_json(row), "stage": row["step_id"] or "", "arguments": _json(row["arguments_json"], {}), "result": _json(row["result_json"], {}), "error": _json(row["error_json"], {})} for row in rows]}
 
 
 @app.get("/api/workspace")
@@ -511,7 +602,7 @@ def restore_document(document_id: str, body: dict[str, Any]) -> dict[str, Any]:
 @app.post("/api/documents/{document_id}/validate")
 def validate_saved_document(document_id: str) -> dict[str, Any]:
     document = get_document(document_id)
-    issues = validate_document(document, enforce_quantity=True)
+    issues = validate_document(document, enforce_quantity=False)
     return {"valid": not issues, "issues": issues}
 
 
