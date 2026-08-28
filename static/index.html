@@ -172,10 +172,10 @@
           <section class="view settings-view" data-view-panel="skills" hidden>
             <p class="eyebrow">SKILLS</p>
             <h2>Skills</h2>
-            <p class="settings-intro">选择 Agent 生成前应用的本地提示词规则。更改会即时保存。</p>
+            <p class="settings-intro">按意图匹配并注入 Skill 索引；大词表通过 read_skill 的 section 按需读取。核心规则始终注入，不能关闭。</p>
             <label class="setting-row" for="skillMode">
-              <span><strong>Agent 能力模式</strong><small>Agent 会按需调用只读 Skill 与内置 Prompt 工具</small></span>
-              <select class="select" id="skillMode"><option value="agent">Agent 自主调用</option></select>
+              <span><strong>Agent 能力模式</strong><small>Compact：匹配 triggers / $skill-name；词表按节读取</small></span>
+              <select class="select" id="skillMode"><option value="agent">按意图匹配注入</option></select>
             </label>
             <div class="setting-panel dynamic-panel skills-panel" id="skillsRows"><div class="settings-empty">正在载入 Skills…</div></div>
           </section>

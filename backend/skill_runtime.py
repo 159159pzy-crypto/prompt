@@ -3,11 +3,14 @@
 Skills are instruction folders under ``.agents/skills``: one ``SKILL.md`` per
 folder following the Codex skill format (learn.chatgpt.com/docs/build-skills.md)
 — YAML frontmatter with a lowercase ``name`` and a ``description``, then the
-instruction body. An optional ``agents/openai.yaml`` may set
-``policy.allow_implicit_invocation: false`` to disable keyword activation.
+instruction body. Optional frontmatter:
 
-The loader keeps discovery metadata small and reads the instruction body only
-for Skills selected for the current request.
+- ``triggers``: phrases that activate the skill (the only implicit matcher)
+- ``depends_on``: other skill ids to inject when this skill is selected
+- ``default_enabled``: catalog default; core skills stay injected regardless
+- ``sections``: named reference files under ``references/<id>.md``
+
+An optional ``agents/openai.yaml`` may set ``policy.allow_implicit_invocation: false``.
 """
 from __future__ import annotations
 
@@ -23,12 +26,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILLS_DIR_NAME = ".agents/skills"
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _EXPLICIT_RE = re.compile(r"(?<!\S)\$([A-Za-z0-9][A-Za-z0-9_-]*)")
-_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
-_CJK_RE = re.compile(r"[\u3400-\u9fff]{2,}")
-_STOP_WORDS = {
-    "and", "are", "for", "from", "that", "the", "this", "use", "with",
-    "when", "only", "into", "your", "you", "not", "should", "skill",
-}
 
 
 @dataclass(frozen=True)
@@ -39,6 +36,10 @@ class RepositorySkill:
     description: str
     path: Path
     allow_implicit_invocation: bool = True
+    default_enabled: bool = True
+    triggers: tuple[str, ...] = ()
+    depends_on: tuple[str, ...] = ()
+    sections: tuple[str, ...] = ()
 
     def catalog_item(self, enabled: bool) -> dict[str, Any]:
         return {
@@ -49,6 +50,10 @@ class RepositorySkill:
             "source": "codex",
             "path": str(self.path),
             "allow_implicit_invocation": self.allow_implicit_invocation,
+            "default_enabled": self.default_enabled,
+            "triggers": list(self.triggers),
+            "depends_on": list(self.depends_on),
+            "sections": list(self.sections),
         }
 
 
@@ -70,6 +75,29 @@ def _frontmatter(text: str, path: Path) -> tuple[dict[str, Any], int]:
     return metadata, sum(len(line) for line in lines[: end + 1])
 
 
+def _string_tuple(value: Any, field: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        raise ValueError(f"{field} must be a string or a list of strings")
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return tuple(result)
+
+
 def _parse_skill(path: Path) -> RepositorySkill:
     text = path.read_text(encoding="utf-8")
     metadata, _ = _frontmatter(text, path)
@@ -87,6 +115,10 @@ def _parse_skill(path: Path) -> RepositorySkill:
     if not isinstance(display_name, str):
         display_name = ""
     display_name = display_name.strip()
+    default_enabled = True if "default_enabled" not in metadata else bool(metadata.get("default_enabled"))
+    triggers = _string_tuple(metadata.get("triggers"), "triggers")
+    depends_on = _string_tuple(metadata.get("depends_on"), "depends_on")
+    sections = _string_tuple(metadata.get("sections"), "sections")
     allow_implicit = True
     openai_yaml = path.parent / "agents" / "openai.yaml"
     if openai_yaml.is_file():
@@ -98,7 +130,10 @@ def _parse_skill(path: Path) -> RepositorySkill:
             raise ValueError("agents/openai.yaml policy must be an object")
         if isinstance(policy, dict) and "allow_implicit_invocation" in policy:
             allow_implicit = bool(policy["allow_implicit_invocation"])
-    return RepositorySkill(name, name, display_name, description, path.resolve(), allow_implicit)
+    return RepositorySkill(
+        name, name, display_name, description, path.resolve(),
+        allow_implicit, default_enabled, triggers, depends_on, sections,
+    )
 
 
 @lru_cache(maxsize=None)
@@ -139,18 +174,29 @@ def discover(repo_root: Path | None = None) -> tuple[list[RepositorySkill], list
 def catalog(value: Any = None, repo_root: Path | None = None) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     enabled = value if isinstance(value, dict) else {}
     discovered, diagnostics = discover(repo_root)
-    return [item.catalog_item(bool(enabled.get(item.id, True))) for item in discovered], diagnostics
+    return [item.catalog_item(bool(enabled.get(item.id, item.default_enabled))) for item in discovered], diagnostics
 
 
-def _description_terms(description: str) -> list[str]:
-    terms = [term.casefold() for term in _WORD_RE.findall(description)]
-    terms.extend(term.casefold() for term in _CJK_RE.findall(description))
-    return [term for term in dict.fromkeys(terms) if term not in _STOP_WORDS]
+def _trigger_match(trigger: str, intent: str) -> bool:
+    needle = trigger.strip()
+    if not needle:
+        return False
+    haystack = intent.casefold()
+    folded = needle.casefold()
+    if any("\u3400" <= char <= "\u9fff" for char in needle):
+        return folded in haystack
+    pattern = r"(?<![A-Za-z0-9_])" + re.escape(folded) + r"(?![A-Za-z0-9_])"
+    return re.search(pattern, haystack) is not None
 
 
 def _implicit_match(skill: RepositorySkill, intent: str) -> bool:
-    lowered = intent.casefold()
-    return any(term in lowered for term in _description_terms(skill.description))
+    if not skill.allow_implicit_invocation or not skill.triggers:
+        return False
+    return any(_trigger_match(trigger, intent) for trigger in skill.triggers)
+
+
+def matching_triggers(skill: RepositorySkill, intent: str) -> list[str]:
+    return [trigger for trigger in skill.triggers if _trigger_match(trigger, intent)]
 
 
 def explicit_names(intent: str) -> set[str]:
@@ -186,9 +232,12 @@ def activate(intent: str, enabled: Any = None, repo_root: Path | None = None) ->
 
     cleaned_intent = _EXPLICIT_RE.sub(replace_explicit, intent)
     for skill in discovered:
-        if not bool(enabled_map.get(skill.id, True)):
+        if skill.name.casefold() in explicit:
+            selected.append(skill)
             continue
-        if skill.name.casefold() in explicit or (skill.allow_implicit_invocation and _implicit_match(skill, intent)):
+        if not bool(enabled_map.get(skill.id, skill.default_enabled)):
+            continue
+        if _implicit_match(skill, intent):
             selected.append(skill)
     return {
         "intent": re.sub(r"\s{2,}", " ", cleaned_intent).strip(),
@@ -202,6 +251,29 @@ def load_instructions(skill: RepositorySkill) -> str:
     text = skill.path.read_text(encoding="utf-8")
     _, body_start = _frontmatter(text, skill.path)
     return text[body_start:].strip()
+
+
+def list_sections(skill: RepositorySkill) -> list[dict[str, str]]:
+    folder = skill.path.parent / "references"
+    items: list[dict[str, str]] = []
+    for section in skill.sections:
+        path = folder / f"{section}.md"
+        items.append({
+            "id": section,
+            "available": path.is_file(),
+            "chars": path.stat().st_size if path.is_file() else 0,
+        })
+    return items
+
+
+def load_section(skill: RepositorySkill, section: str) -> str:
+    name = str(section or "").strip()
+    if name not in skill.sections:
+        raise ValueError(f"unknown section for {skill.id}: {section}")
+    path = skill.path.parent / "references" / f"{name}.md"
+    if not path.is_file():
+        raise ValueError(f"missing reference file: {path}")
+    return path.read_text(encoding="utf-8").strip()
 
 
 def render_selected(value: Any) -> list[str]:
@@ -219,6 +291,10 @@ def render_selected(value: Any) -> list[str]:
                 str(item.get("description") or ""),
                 Path(str(item["path"])),
                 bool(item.get("allow_implicit_invocation", True)),
+                bool(item.get("default_enabled", True)),
+                tuple(item.get("triggers") or ()),
+                tuple(item.get("depends_on") or ()),
+                tuple(item.get("sections") or ()),
             )
         else:
             continue

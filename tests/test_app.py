@@ -1,4 +1,3 @@
-import json
 from contextlib import contextmanager
 import json
 import pytest
@@ -9,9 +8,25 @@ from backend import db
 from backend import agent
 from backend.app import app
 from backend.documents import validate_document
-from backend.skills import instructions
+from backend.skills import build_skill_state, catalog, instructions, selected_ids
 from backend import skill_runtime
 from backend import run_store, worker
+
+SIMPLE_TOKENS = [
+    "1girl", "solo", "long hair", "blue eyes", "school uniform", "standing",
+    "blush", "cowboy shot", "classroom", "indoors", "looking at viewer",
+    "facing viewer", "smile", "bangs", "white shirt", "skirt",
+]
+SIMPLE_ZH = [
+    "一个女孩", "单人", "长发", "蓝眼睛", "校服", "站立",
+    "脸红", "牛仔镜头", "教室", "室内", "看向观众",
+    "面向观众", "微笑", "刘海", "白衬衫", "裙子",
+]
+ALT_TOKENS = [
+    "1girl", "solo", "short hair", "red eyes", "hoodie", "sitting",
+    "angry", "close-up", "bedroom", "night", "profile",
+    "from side", "frown", "twintails", "jeans", "sneakers",
+]
 
 
 @contextmanager
@@ -181,7 +196,7 @@ async def test_worker_executes_queued_run_and_persists_result(tmp_path, monkeypa
             async def __aenter__(self): return self
             async def __aexit__(self, *_args): return None
             async def post(self, *_args, **_kwargs):
-                payload = {"choices": [{"message": {"content": json.dumps({"variants": [{"positive_tokens": ["1girl", "rain"]}]}, ensure_ascii=False), "tool_calls": []}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 2, "completion_tokens": 4}}
+                payload = {"choices": [{"message": {"content": json.dumps({"variants": [{"positive_tokens": SIMPLE_TOKENS}]}, ensure_ascii=False), "tool_calls": []}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 2, "completion_tokens": 4}}
                 class Response:
                     def raise_for_status(self): return None
                     def json(self): return payload
@@ -193,7 +208,7 @@ async def test_worker_executes_queued_run_and_persists_result(tmp_path, monkeypa
         await worker.execute_run(claimed, "test-worker")
         status = client.get(f"/api/runs/{created['run_id']}").json()
         assert status["status"] == "completed"
-        assert status["result"]["variants"][0]["positive_tokens"][0]["raw_text"] == "1girl"
+        assert [item["raw_text"] for item in status["result"]["variants"][0]["positive_tokens"][:2]] == ["1girl", "solo"]
         assert len(client.get(f"/api/runs/{created['run_id']}/events").json()["items"]) >= 4
 
 
@@ -259,10 +274,14 @@ def test_backend_lint_checks_section_13_6_and_quantity_band():
 def test_compact_skill_mode_injects_core_and_relevant_library_only():
     compact = instructions({"__mode": "compact", "__intent": "雨夜街头女孩穿制服"})
     full = instructions({"__mode": "full", "__intent": "雨夜街头女孩穿制服"})
+    compact_ids = selected_ids({"__mode": "compact", "__intent": "雨夜街头女孩穿制服"})
     assert len(compact) < len(full)
-    assert any("Anima-compatible tags" in item for item in compact)
-    assert any("服装与状态标签库" in item for item in compact)
-    assert not any("特殊主题配方" in item for item in compact)
+    assert "clothing-library" in compact_ids
+    assert "mood-library" in compact_ids
+    assert "special-themes" not in compact_ids
+    assert "deepseek-unrestricted" not in compact_ids
+    assert any("顺序即权重" in item for item in compact)
+    assert any("原服装 × 改造方向" in item for item in compact)
 
 
 def test_generation_request_parser_supports_chinese_and_english_counts():
@@ -332,7 +351,7 @@ def test_model_output_is_validated_and_never_falls_back(tmp_path, monkeypatch):
         provider = client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test", "env_name": "ANIMA_TEST_KEY"}).json()
         assert provider["timeout"] == 120
         assert provider["max_tokens"] == 4096
-        valid = {"variants": [{"title": "Rain", "intent": "雨夜", "positive_tokens": ["1girl", "blue eyes"], "negative": "low quality, bad anatomy"}]}
+        valid = {"variants": [{"title": "Rain", "intent": "雨夜", "positive_tokens": SIMPLE_TOKENS, "negative": "low quality, bad anatomy"}]}
         monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **_kwargs: FakeClient(json.dumps(valid, ensure_ascii=False)))
         result = client.post("/api/generate", json={"intent": "雨夜女孩"}).json()
         assert result["status"] == "completed"
@@ -360,14 +379,14 @@ def test_json_in_reasoning_content_is_recovered(tmp_path, monkeypatch):
     monkeypatch.setenv("ANIMA_TEST_KEY", "test-only")
     with client_for(tmp_path, monkeypatch) as client:
         client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "deepseek-v4-flash", "env_name": "ANIMA_TEST_KEY"})
-        valid = {"variants": [{"title": "Rain", "positive_tokens": ["1girl", "rain"], "negative_tokens": ["low quality"]}]}
+        valid = {"variants": [{"title": "Rain", "positive_tokens": SIMPLE_TOKENS, "negative_tokens": ["low quality"]}]}
         reasoning = "The requested JSON follows.\n```json\n" + json.dumps(valid) + "\n```"
         monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **_kwargs: FakeClient("", reasoning_content=reasoning))
 
         result = client.post("/api/generate", json={"intent": "雨夜女孩"}).json()
 
         assert result["status"] == "completed"
-        assert [item["raw_text"] for item in result["variants"][0]["positive_tokens"]] == ["1girl", "rain"]
+        assert [item["raw_text"] for item in result["variants"][0]["positive_tokens"][:2]] == ["1girl", "solo"]
 
 
 def test_empty_content_reports_actual_token_limit_finish(tmp_path, monkeypatch):
@@ -393,7 +412,7 @@ def test_malformed_model_json_is_repaired_before_validation(tmp_path, monkeypatc
         {
           "variants": [{
             "title": "Rain"
-            "positive_tokens": ["1girl", "rain"],
+            "positive_tokens": ["1girl", "solo", "long hair", "blue eyes", "school uniform", "standing", "blush", "cowboy shot", "classroom", "indoors", "looking at viewer", "facing viewer", "smile", "bangs", "white shirt", "skirt"],
             "negative_tokens": ["low quality"]
           }]
         }
@@ -403,47 +422,42 @@ def test_malformed_model_json_is_repaired_before_validation(tmp_path, monkeypatc
         result = client.post("/api/generate", json={"intent": "雨夜女孩"}).json()
 
         assert result["status"] == "completed"
-        assert [item["raw_text"] for item in result["variants"][0]["positive_tokens"]] == ["1girl", "rain"]
+        assert [item["raw_text"] for item in result["variants"][0]["positive_tokens"][:2]] == ["1girl", "solo"]
 
 
 def test_chinese_explanation_is_required_when_requested(tmp_path, monkeypatch):
     monkeypatch.setenv("ANIMA_TEST_KEY", "test-only")
     with client_for(tmp_path, monkeypatch) as client:
         client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test", "env_name": "ANIMA_TEST_KEY"})
-        valid = {"variants": [{"title": "Rain", "positive_tokens": ["1girl"], "negative_tokens": ["low quality"], "positive_translations": ["一个女孩"], "negative_translations": ["低质量"]}]}
+        valid = {"variants": [{"title": "Rain", "positive_tokens": SIMPLE_TOKENS, "negative_tokens": ["low quality"], "positive_translations": SIMPLE_ZH, "negative_translations": ["低质量"]}]}
         monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **_kwargs: FakeClient(json.dumps(valid, ensure_ascii=False)))
         result = client.post("/api/generate", json={"intent": "雨夜女孩", "include_chinese": True}).json()
         assert result["status"] == "completed"
         variant = result["variants"][0]
-        assert variant["positive_translations"] == ["一个女孩"]
-        assert variant["chinese_explanation"] == "一个女孩"
+        assert variant["positive_translations"] == SIMPLE_ZH
+        assert variant["chinese_explanation"] == "，".join(SIMPLE_ZH)
         assert "negative_tokens" not in variant
         assert "negative_translations" not in variant
 
-        missing = {"variants": [{"positive_tokens": ["1girl"]}]}
-        monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **_kwargs: FakeClient(json.dumps(missing, ensure_ascii=False)))
-        result = client.post("/api/generate", json={"intent": "再次生成", "include_chinese": True}).json()
-        assert result["status"] == "failed"
-        assert result["variants"] == []
-        assert result["error"]["code"] == "token_translation_invalid"
+        with pytest.raises(agent.ModelResponseError) as missing_exc:
+            agent.validate_variant({"positive_tokens": SIMPLE_TOKENS}, True)
+        assert missing_exc.value.code == "token_translation_invalid"
 
-        mismatch = {"variants": [{"positive_tokens": ["1girl", "blue eyes"], "positive_translations": ["一个女孩"]}]}
-        monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **_kwargs: FakeClient(json.dumps(mismatch, ensure_ascii=False)))
-        result = client.post("/api/generate", json={"intent": "数量不匹配", "include_chinese": True}).json()
-        assert result["error"]["code"] == "token_translation_count_mismatch"
+        with pytest.raises(agent.ModelResponseError) as mismatch_exc:
+            agent.validate_variant({"positive_tokens": SIMPLE_TOKENS, "positive_translations": ["一个女孩"]}, True)
+        assert mismatch_exc.value.code == "token_translation_count_mismatch"
 
-        protected = {"variants": [{"positive_tokens": [{"raw_text": "<lora:rain:0.8>", "locked": True}], "positive_translations": ["雨天风格"]}]}
-        monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **_kwargs: FakeClient(json.dumps(protected, ensure_ascii=False)))
-        result = client.post("/api/generate", json={"intent": "保护词不能翻译", "include_chinese": True}).json()
-        assert result["error"]["code"] == "protected_translation_changed"
+        with pytest.raises(agent.ModelResponseError) as protected_exc:
+            agent.validate_variant({"positive_tokens": [{"raw_text": "<lora:rain:0.8>", "locked": True}] + [{"raw_text": item} for item in SIMPLE_TOKENS[1:]], "positive_translations": ["雨天风格"] + SIMPLE_ZH[1:]}, True)
+        assert protected_exc.value.code == "protected_translation_changed"
 
 
 def test_invalid_model_fields_are_retried_once_with_feedback(tmp_path, monkeypatch):
     monkeypatch.setenv("ANIMA_TEST_KEY", "test-only")
     with client_for(tmp_path, monkeypatch) as client:
         client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test", "env_name": "ANIMA_TEST_KEY"})
-        missing_translations = {"variants": [{"positive_tokens": ["1girl"]}]}
-        corrected = {"variants": [{"positive_tokens": ["1girl"], "positive_translations": ["一个女孩"]}]}
+        missing_translations = {"variants": [{"positive_tokens": SIMPLE_TOKENS}]}
+        corrected = {"variants": [{"positive_tokens": SIMPLE_TOKENS, "positive_translations": SIMPLE_ZH}]}
         fake_client = SequenceFakeClient([
             json.dumps(missing_translations, ensure_ascii=False),
             json.dumps(corrected, ensure_ascii=False),
@@ -453,7 +467,7 @@ def test_invalid_model_fields_are_retried_once_with_feedback(tmp_path, monkeypat
         result = client.post("/api/generate", json={"intent": "雨夜女孩", "include_chinese": True}).json()
 
         assert result["status"] == "completed"
-        assert result["variants"][0]["positive_translations"] == ["一个女孩"]
+        assert result["variants"][0]["positive_translations"] == SIMPLE_ZH
         assert len(fake_client.requests) == 2
         assert "failed validation" in fake_client.requests[-1]["json"]["messages"][-1]["content"]
 
@@ -462,7 +476,7 @@ def test_agent_tool_loop_persists_trace_and_exposes_tools(tmp_path, monkeypatch)
     monkeypatch.setenv("ANIMA_TEST_KEY", "test-only")
     with client_for(tmp_path, monkeypatch) as client:
         provider = client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test", "env_name": "ANIMA_TEST_KEY"}).json()
-        final = {"variants": [{"title": "Rain", "positive_tokens": ["1girl", "rain"]}]}
+        final = {"variants": [{"title": "Rain", "positive_tokens": SIMPLE_TOKENS}]}
         class ToolClient:
             def __init__(self): self.calls = 0; self.requests = []
             async def __aenter__(self): return self
@@ -501,8 +515,7 @@ def test_vague_multi_request_uses_selected_model_for_helper_and_generation(tmp_p
                 if len(self.requests) == 1:
                     payload = {"choices": [{"message": {"content": '{"requested_count":2,"explicit_count":false,"variation_dimensions":[],"dedupe_required":true}'}, "finish_reason": "stop"}]}
                 else:
-                    tokens = [f"token-{index}" for index in range(16)]
-                    payload = {"choices": [{"message": {"content": json.dumps({"variants": [{"positive_tokens": tokens}, {"positive_tokens": tokens + ["rain"]}]})}, "finish_reason": "stop"}]}
+                    payload = {"choices": [{"message": {"content": json.dumps({"variants": [{"positive_tokens": SIMPLE_TOKENS}, {"positive_tokens": ALT_TOKENS}]})}, "finish_reason": "stop"}]}
                 class Response:
                     def raise_for_status(self): return None
                     def json(self_nonlocal): return payload
@@ -527,7 +540,7 @@ def test_unknown_tool_is_returned_to_agent_as_tool_error(tmp_path, monkeypatch):
                 if self.calls == 1:
                     payload = {"choices": [{"message": {"content": "", "tool_calls": [{"id": "x", "type": "function", "function": {"name": "shell", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}]}
                 else:
-                    payload = {"choices": [{"message": {"content": '{"variants":[{"positive_tokens":["1girl"]}]}', "tool_calls": []}, "finish_reason": "stop"}]}
+                    payload = {"choices": [{"message": {"content": json.dumps({"variants": [{"positive_tokens": SIMPLE_TOKENS}]}), "tool_calls": []}, "finish_reason": "stop"}]}
                 class Response:
                     def raise_for_status(self): return None
                     def json(self_nonlocal): return payload
@@ -597,11 +610,14 @@ def test_generation_uses_explicit_provider_selection(tmp_path, monkeypatch):
         assert captured["provider_id"] != first["id"]
 
 
-def write_codex_skill(root, name="demo", description="Use demo workflow for rainy scenes.", body="Demo instructions", display_name="Demo"):
+def write_codex_skill(root, name="demo", description="Use demo workflow for rainy scenes.", body="Demo instructions", display_name="Demo", triggers=None):
     skill_dir = root / ".agents" / "skills" / name
     skill_dir.mkdir(parents=True, exist_ok=True)
+    extra = ""
+    if triggers:
+        extra = "triggers:\n" + "".join(f"  - {item}\n" for item in triggers)
     (skill_dir / "SKILL.md").write_text(
-        f"---\nname: {name}\ndisplay_name: {display_name}\ndescription: {description}\n---\n\n{body}\n",
+        f"---\nname: {name}\ndisplay_name: {display_name}\ndescription: {description}\n{extra}---\n\n{body}\n",
         encoding="utf-8",
     )
     return skill_dir
@@ -648,8 +664,8 @@ def test_codex_skill_explicit_trigger_strips_marker_and_unknown_marker_is_preser
 
 
 def test_codex_skill_implicit_policy_and_enabled_state(tmp_path, monkeypatch):
-    write_codex_skill(tmp_path, description="Rain workflow")
-    blocked = write_codex_skill(tmp_path, name="blocked", description="Snow workflow")
+    write_codex_skill(tmp_path, description="Rain workflow", triggers=["rain"])
+    blocked = write_codex_skill(tmp_path, name="blocked", description="Snow workflow", triggers=["snow"])
     (blocked / "agents").mkdir()
     (blocked / "agents" / "openai.yaml").write_text("policy:\n  allow_implicit_invocation: false\n", encoding="utf-8")
     monkeypatch.setattr(skill_runtime, "REPO_ROOT", tmp_path)
@@ -664,8 +680,8 @@ def test_codex_skill_implicit_policy_and_enabled_state(tmp_path, monkeypatch):
 
 
 def test_codex_skill_body_is_loaded_only_when_selected(tmp_path, monkeypatch):
-    write_codex_skill(tmp_path, description="Rain workflow", body="RAIN BODY")
-    write_codex_skill(tmp_path, name="other", description="Other workflow", body="OTHER BODY")
+    write_codex_skill(tmp_path, description="Rain workflow", body="RAIN BODY", triggers=["rain"])
+    write_codex_skill(tmp_path, name="other", description="Other workflow", body="OTHER BODY", triggers=["other"])
     monkeypatch.setattr(skill_runtime, "REPO_ROOT", tmp_path)
 
     activated = skill_runtime.activate("rain")
@@ -727,4 +743,72 @@ def test_explicit_skill_marker_survives_run_queue_and_worker_payload(tmp_path, m
 def test_disabled_non_core_skill_is_not_injected_even_when_requested():
     state = {"__mode": "compact", "__intent": "雨夜制服", "clothing-library": False}
     selected = instructions(state)
-    assert not any("服装与状态标签库" in item for item in selected)
+    assert not any("原服装 × 改造方向" in item for item in selected)
+
+
+def test_solo_plus_one_girl_is_valid_and_two_girls_is_not_complex():
+    solo = {"intent": "一个女孩", "positive_tokens": [{"raw_text": item} for item in SIMPLE_TOKENS], "negative_tokens": []}
+    assert not any(issue["code"] == "conflicting_count" for issue in validate_document(solo))
+    quantity = next(issue for issue in validate_document({"intent": "单人展示", "positive_tokens": [{"raw_text": "solo"}], "negative_tokens": []}, enforce_quantity=True) if issue["code"] == "quantity_out_of_range")
+    assert quantity["band"] == "simple"
+
+    pair = {"intent": "两个女孩站着聊天", "positive_tokens": [{"raw_text": "2girls"}], "negative_tokens": []}
+    pair_issues = validate_document(pair, enforce_quantity=True)
+    pair_quantity = next(issue for issue in pair_issues if issue["code"] == "quantity_out_of_range")
+    assert pair_quantity["band"] == "simple"
+    assert pair_quantity["minimum"] == 16
+
+    sex = {"intent": "two-person sex", "positive_tokens": [{"raw_text": "1girl"}, {"raw_text": "1boy"}, {"raw_text": "sex"}], "negative_tokens": []}
+    sex_quantity = next(issue for issue in validate_document(sex, enforce_quantity=True) if issue["code"] == "quantity_out_of_range")
+    assert sex_quantity["band"] == "standard"
+
+
+def test_people_count_is_not_variant_count():
+    parsed = agent.parse_generation_request("教室里两个人做爱")
+    assert parsed["requested_count"] == 1
+    assert parsed["explicit_count"] is False
+    assert agent.parse_generation_request("五个女孩")["requested_count"] == 1
+    assert agent.parse_generation_request("给我生成5组服装变体")["requested_count"] == 5
+
+
+def test_sex_intent_selects_pose_and_expression_but_not_sandbox():
+    ids = selected_ids({"__mode": "compact", "__intent": "教室里两个人做爱"})
+    assert "pose-library" in ids
+    assert "expression-library" in ids
+    assert "deepseek-unrestricted" not in ids
+    noisy = selected_ids({"__mode": "compact", "__intent": "这个场景用于展示角色日常"})
+    assert "deepseek-unrestricted" not in noisy
+    assert "special-themes" not in selected_ids({"__mode": "compact", "__intent": "请写特殊一点的构图"})
+
+
+def test_worker_and_generate_share_compact_skill_state():
+    parsed = agent.parse_generation_request("雨夜街头的女孩")
+    generate_state = build_skill_state("雨夜街头的女孩", {}, parsed_request=parsed)
+    worker_state = build_skill_state("雨夜街头的女孩", {}, parsed_request=parsed, explicit_skill_ids=[])
+    assert generate_state["__mode"] == worker_state["__mode"] == "compact"
+    assert generate_state["__selected_skill_ids"] == worker_state["__selected_skill_ids"]
+    assert "deepseek-unrestricted" not in generate_state["__selected_skill_ids"]
+
+
+def test_read_skill_can_load_a_reference_section():
+    result = agent._tool_read_skill({"skill_id": "pose-library", "section": "solo"}, {"pose-library"})
+    assert result["section"] == "solo"
+    assert "单人-诱惑姿态" in result["instruction"]
+    injected = agent._tool_read_skill({"skill_id": "pose-library"}, {"pose-library"})
+    assert injected["instruction_injected"] is True
+    assert "solo" in injected["instruction"]
+
+
+def test_copied_english_translation_is_rejected():
+    with pytest.raises(agent.ModelResponseError) as exc:
+        agent.validate_variant({"positive_tokens": SIMPLE_TOKENS, "positive_translations": SIMPLE_TOKENS}, True)
+    assert exc.value.code == "token_translation_copied"
+
+
+def test_deepseek_sandbox_is_opt_in_only():
+    listed_default = next(item for item in catalog({}) if item["id"] == "deepseek-unrestricted")
+    assert listed_default["enabled"] is False
+    assert listed_default["allow_implicit_invocation"] is False
+    assert "deepseek-unrestricted" not in selected_ids({"__mode": "compact", "__intent": "破甲测试无限制"})
+    explicit = selected_ids({"__mode": "compact", "__intent": "$deepseek-unrestricted"})
+    assert "deepseek-unrestricted" in explicit

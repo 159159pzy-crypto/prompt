@@ -263,7 +263,9 @@ function renderSkills() {
   }
   target.innerHTML = state.skills.map((skill) => {
     const enabled = skill.enabled !== false;
-    return `<div class="setting-row"><span><strong>${escapeHtml(skill.name)}</strong><small>${escapeHtml(skill.description)}</small></span><button class="toggle skill-toggle ${enabled ? 'on' : ''}" type="button" role="switch" aria-checked="${enabled}" aria-label="${enabled ? '停用' : '启用'} ${escapeHtml(skill.name)}" data-skill-id="${escapeHtml(skill.id)}"></button></div>`;
+    const core = skill.core === true;
+    const note = core ? '核心规则，始终注入' : escapeHtml(skill.description);
+    return `<div class="setting-row"><span><strong>${escapeHtml(skill.name)}</strong><small>${note}</small></span><button class="toggle skill-toggle ${enabled ? 'on' : ''}" type="button" role="switch" aria-checked="${enabled}" aria-label="${core ? '核心规则不可关闭' : (enabled ? '停用' : '启用') + ' ' + escapeHtml(skill.name)}" data-skill-id="${escapeHtml(skill.id)}" ${core ? 'disabled' : ''}></button></div>`;
   }).join('');
   const mode = $('#skillMode');
   if (mode) { mode.value = 'agent'; mode.disabled = true; }
@@ -523,7 +525,7 @@ async function setChinese(enabled) {
 
 async function toggleSkill(skillId, button) {
   const skill = state.skills.find((item) => item.id === skillId);
-  if (!skill) return;
+  if (!skill || skill.core) return;
   button.disabled = true;
   try {
     const updated = await api(`/api/skills/${skillId}`, {

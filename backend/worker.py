@@ -8,9 +8,11 @@ import time
 from typing import Any
 
 from . import app
+from .agent import parse_generation_request
 from .db import init_db, now
 from .orchestrator import run_pipeline
 from .run_store import append_event, claim_next, finish_run, heartbeat, is_cancelled, owner_id, recover_expired, update_run
+from .skills import build_skill_state
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +46,16 @@ async def execute_run(run: dict[str, Any], owner: str | None = None) -> dict[str
     provider = app._provider(body.provider_id or str(app._runtime_settings().get("provider_id") or ""))
     secret = app._provider_secret(provider) if provider else ""
     runtime = app._runtime_settings()
-    skills = {item["id"]: True for item in app.skill_catalog({})}
-    skills.update(dict(runtime.get("skills") or {}))
-    skills["__intent"] = body.intent
-    skills["__explicit_skill_ids"] = list((body.current_document or {}).get("_explicit_skill_ids") or [])
-    skills["__selected_skill_ids"] = []
-    from .skills import selected_ids
-    skills["__selected_skill_ids"] = selected_ids(skills)
+    fallback = len((body.current_document or {}).get("variants") or []) if body.mode == "modify" else 1
+    parse_intent = (body.current_document or {}).get("modification_request") or body.intent
+    parsed = parse_generation_request(parse_intent, fallback_count=fallback)
+    skill_intent = f"{body.intent} {parse_intent}".strip() if body.mode == "modify" else body.intent
+    skills = build_skill_state(
+        skill_intent,
+        runtime.get("skills") or {},
+        parsed_request=parsed,
+        explicit_skill_ids=list((body.current_document or {}).get("_explicit_skill_ids") or []),
+    )
     started = time.perf_counter()
 
     def emit(event: dict[str, Any]) -> None:

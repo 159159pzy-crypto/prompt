@@ -12,7 +12,7 @@ FORBIDDEN_SECTION_13_6 = frozenset({
     "backlighting", "rim light", "warm lighting", "cool lighting", "golden hour glow", "soft lighting",
     "warm tone", "cool tone", "sepia", "blue tone", "amber tone", "god rays", "light rays",
     "light particles", "volumetric light beams", "tyndall effect", "glowing", "illuminated", "lit",
-    "backlit", "spotlight", "flash",
+    "backlit", "backlit silhouette", "spotlight", "flash", "chiaroscuro", "dramatic shadows",
 })
 
 GENERIC_BANNED_TOKENS = frozenset({

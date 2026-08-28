@@ -21,7 +21,7 @@ py -3.11 -m pip install -r requirements.txt
 
 ## Skills（codex 格式）
 
-内置技能以 Codex 兼容格式存放于 `.agents/skills/<name>/SKILL.md`：YAML frontmatter 含 `name`、`display_name`、`description`，正文为指令（参考 learn.chatgpt.com/docs/build-skills.md）。Agent 可通过 `list_skills` 和 `read_skill` 按需读取；已经注入 system message 的 Skill 会返回轻量元数据，避免重复传输正文；每个 Run 最多执行 32 次工具调用。`validate_prompt` 与 `normalize_prompt` 提供确定性校验和规范化。可向 `.agents/skills` 添加自定义 SKILL.md（重名/缺 SKILL.md 等会在 `GET /api/skills` 的 diagnostics 中报告）。
+内置技能以 Codex 兼容格式存放于 `.agents/skills/<name>/SKILL.md`：YAML frontmatter 含 `name`、`display_name`、`description`，以及可选的 `triggers`、`depends_on`、`sections`、`default_enabled`。正文是索引级指令；大词表放在同目录 `references/<section>.md`。生成时只注入匹配到的 Skill 索引，Agent 用 `read_skill` 的 `section` 参数按需取词表。已经注入的索引再读会返回轻量元数据。核心规则始终注入，设置页不能关闭。`deepseek-unrestricted` 默认关闭且禁止隐式匹配。每个 Run 最多 32 次工具调用。`validate_prompt(enforce_quantity=true)` 与 `normalize_prompt` 提供确定性校验。可向 `.agents/skills` 添加自定义 SKILL.md（重名/缺文件会在 `GET /api/skills` 的 diagnostics 中报告）。
 
 前端按现有配置工作：供应商页只负责启停已有连接，不提供新增、密钥编辑或导入入口。供应商配置 API 与旧 Prompt Document API 继续保留，供兼容或外部工具使用。
 
@@ -59,7 +59,7 @@ Agent 使用固定 `Planner -> Generator -> Validator/Repair -> Finalizer` 流�
 
 `POST /api/generate` 的新候选只返回 `positive_tokens`，中文模式另返回等长同序的 `positive_translations`。旧文档中的 `negative_tokens` 字段不迁移、不删除，文档读取、版本和导出保持兼容。
 
-文档 lint 会检查重复 Token、数量互斥、§13.6 禁令词；显式场景数量校验支持单人 16-30、双人 22-38、复杂 30-48。保存接口和兼容生成接口保持短文档兼容。
+文档 lint 会检查重复 Token、数量互斥、§13.6 禁令词。生成路径强制数量档位：单人展示 16-30，双人色情/前戏 22-38，三人及以上 30-48。`solo` 可与 `1girl`/`1boy` 共存。保存接口和兼容生成接口保持短文档兼容。
 
 ## 验证
 

@@ -19,7 +19,7 @@ from .documents import canonical_document, document_view as _document_view, expo
 from .secrets import delete_secret, get_secret, put_secret
 from . import skill_runtime
 from .skill_runtime import strip_explicit_markers
-from .skills import catalog as skill_catalog, discovery_diagnostics
+from .skills import build_skill_state, catalog as skill_catalog, discovery_diagnostics
 from .run_store import ACTIVE, TERMINAL, append_event, cancel_run as cancel_stored_run, create_run, decode_run, get_run, list_events
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -447,9 +447,12 @@ async def retry_agent_run(run_id: str) -> dict[str, Any]:
 @app.post("/api/generate")
 async def generate(body: GenerateIn) -> dict[str, Any]:
     runtime = _runtime_settings()
+    activation = skill_runtime.activate(body.intent, runtime.get("skills") or {})
     request_intent = strip_explicit_markers(body.intent)
     original_intent = request_intent
     parent_run = None
+    current_document = dict(body.current_document or {})
+    current_document["_explicit_skill_ids"] = activation["selected_skill_ids"]
     if body.mode == "modify":
         if not body.conversation_id or not body.parent_run_id:
             raise HTTPException(400, "修改当前对话需要 conversation_id 和 parent_run_id")
@@ -458,12 +461,11 @@ async def generate(body: GenerateIn) -> dict[str, Any]:
         if not parent_run:
             raise HTTPException(400, "当前对话版本不存在，请刷新后重试")
         original_intent = parent_run["intent"]
-        current_document = dict(body.current_document or {})
         current_document.setdefault("original_intent", original_intent)
         current_document["modification_request"] = request_intent
         body = body.model_copy(update={"intent": original_intent, "current_document": current_document})
     else:
-        body = body.model_copy(update={"intent": request_intent})
+        body = body.model_copy(update={"intent": request_intent, "current_document": current_document})
     provider_id = body.provider_id or str(runtime.get("provider_id") or "")
     provider = _provider(provider_id)
     if provider_id and not provider:
@@ -476,25 +478,19 @@ async def generate(body: GenerateIn) -> dict[str, Any]:
     parsed_request = parse_generation_request(parse_intent or body.intent, fallback_count=fallback_count)
     if parsed_request["explicit_count"]:
         body = body.model_copy(update={"requested_count": parsed_request["requested_count"]})
-    capability_state = {item["id"]: True for item in skill_catalog({})}
-    capability_state.update(dict(runtime.get("skills") or {}))
-    capability_state["__intent"] = body.intent
-    capability_state["__mode"] = "compact"
-    capability_state["__requested_count"] = parsed_request["requested_count"]
-    capability_state["__variation_dimensions"] = parsed_request["variation_dimensions"]
-    capability_state["__dedupe_required"] = parsed_request["dedupe_required"]
-    activation = skill_runtime.activate(body.intent, runtime.get("skills") or {})
-    capability_state["__explicit_skill_ids"] = activation["selected_skill_ids"]
-    capability_state["__selected_skill_ids"] = []
-    from .skills import selected_ids
-    capability_state["__selected_skill_ids"] = selected_ids(capability_state)
+    skill_intent = f"{body.intent} {parse_intent}".strip() if body.mode == "modify" else body.intent
+    capability_state = build_skill_state(
+        skill_intent,
+        runtime.get("skills") or {},
+        parsed_request=parsed_request,
+        explicit_skill_ids=activation["selected_skill_ids"],
+    )
     result = await generate_agent(body, provider, _provider_secret(provider), str(runtime.get("system_prompt") or ""), capability_state)
     run_id = str(uuid.uuid4())
     conversation_id = body.conversation_id or run_id
     with connect() as db:
         latest_revision = db.execute("SELECT COALESCE(MAX(revision), 0) AS revision FROM agent_runs WHERE conversation_id=?", (conversation_id,)).fetchone()["revision"]
     revision = int(latest_revision) + 1
-    all_skills = skill_catalog(runtime.get("skills"))
     tool_trace = result.get("tool_trace") or []
     response = {"id": run_id, "status": result["status"], "engine": result["engine"], "provider_id": provider["id"] if provider else "", "model": body.model, "reasoning_effort": body.reasoning_effort, "variants": result["variants"], "error": result.get("error"), "selected_skill_ids": result.get("selected_skill_ids") or capability_state["__selected_skill_ids"], "skill_diagnostics": discovery_diagnostics(), "variant_diagnostics": result.get("variant_diagnostics", []), "tool_trace": tool_trace, "usage": {"latency_ms": result.get("latency_ms"), "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens")}, "conversation_id": conversation_id, "parent_run_id": body.parent_run_id, "revision": revision, "mode": body.mode}
     with connect() as db:

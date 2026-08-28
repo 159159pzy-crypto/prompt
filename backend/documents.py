@@ -13,11 +13,22 @@ from .db import connect, now, row_json
 from .prompt import classify, parse_prompt, serialize_prompt
 
 PROTECTED_RE = re.compile(r"^(?:<lora:[^>]+>|<embed:[^>]+>|BREAK)$", re.I)
+_PERSON_COUNT_RE = re.compile(r"^(\d+)\s*(girls?|boys?)$")
+_MULTI_COUNT_TAGS = frozenset({"multiple", "multiple girls", "multiple boys", "group sex"})
+_PAIRING_TAGS = frozenset({"hetero", "yuri"})
+_SEX_TAGS = frozenset({
+    "sex", "vaginal", "anal", "fellatio", "cunnilingus", "paizuri", "missionary",
+    "doggystyle", "cowgirl position", "reverse cowgirl position", "group sex",
+    "spitroast", "rape", "gangbang", "masturbation", "fingering", "footjob",
+    "handjob", "oral", "creampie", "penetration", "double penetration",
+    "triple penetration", "sleep molestation",
+})
+_SEX_INTENT = ("性交", "做爱", "性爱", "前戏", "口交", "后入", "骑乘", "自慰", "体位", "插入", "foreplay", "sex")
+_SOLO_CONFLICTS = frozenset({"2girls", "2boys", "multiple", "multiple girls", "multiple boys", "hetero", "yuri", "group sex"})
 
 
-def _count_band(document: dict[str, Any]) -> tuple[str, int, int] | None:
-    """Infer the template quantity band from count tags and the declared intent."""
-    names = {
+def _token_names(document: dict[str, Any]) -> set[str]:
+    return {
         value
         for item in document.get("positive_tokens", [])
         for value in (
@@ -26,19 +37,49 @@ def _count_band(document: dict[str, Any]) -> tuple[str, int, int] | None:
         )
         if value
     }
+
+
+def _person_count(names: set[str]) -> int:
+    girls = 0
+    boys = 0
+    for name in names:
+        match = _PERSON_COUNT_RE.fullmatch(name)
+        if not match:
+            continue
+        count = int(match.group(1))
+        if "girl" in match.group(2):
+            girls = max(girls, count)
+        else:
+            boys = max(boys, count)
+    total = girls + boys
+    if names & _MULTI_COUNT_TAGS:
+        total = max(total, 3)
+    if names & _PAIRING_TAGS:
+        total = max(total, 2)
+    if total:
+        return total
+    if "solo" in names or "1girl" in names or "1boy" in names:
+        return 1
+    return 0
+
+
+def _count_band(document: dict[str, Any]) -> tuple[str, int, int] | None:
+    """Infer the quantity band from person count and whether the scene is sexual."""
+    names = _token_names(document)
     intent = str(document.get("intent", "")).casefold()
-    if {"1girl", "1boy"} <= names or "hetero" in names or "yuri" in names or any(word in intent for word in ("双人", "两人", "前戏", "性交", "体位", "男女", "情侣", "two-person", "foreplay")):
-        return "standard", 22, 38
-    if names & {"multiple", "multiple girls", "multiple boys", "group sex"} or re.search(r"\b(?:[2-9]|[1-9]\d+)girls?\b|\b(?:[2-9]|[1-9]\d+)boys?\b", " ".join(names)):
+    people = _person_count(names)
+    if people == 0:
+        if any(word in intent for word in ("多人", "群交")):
+            return "complex", 30, 48
+        if any(word in intent for word in ("单人", "一个女孩", "一个男孩", "一名女孩", "一名男孩", "single-person", "solo")):
+            return "simple", 16, 30
+        return None
+    if people >= 3:
         return "complex", 30, 48
-    if any(word in intent for word in ("多人", "群交", "剧情主视觉", "特殊主题")):
-        return "complex", 30, 48
-    single_person = (
-        "solo" in names
-        or bool(names & {"1girl", "1boy"})
-        or any(word in intent for word in ("单人", "一个女孩", "一个男孩", "一名女孩", "一名男孩", "single-person", "solo"))
-    )
-    return ("simple", 16, 30) if single_person else None
+    if people == 2:
+        erotic = bool(names & (_SEX_TAGS | _PAIRING_TAGS)) or any(word in intent for word in _SEX_INTENT)
+        return ("standard", 22, 38) if erotic else ("simple", 16, 30)
+    return "simple", 16, 30
 
 
 def json_value(value: str | None, fallback: Any) -> Any:
@@ -116,8 +157,8 @@ def validate_document(document: dict[str, Any], *, enforce_quantity: bool = Fals
             if not isinstance(weight, (int, float)) or not math.isfinite(float(weight)) or not 0 < float(weight) <= 3:
                 issues.append({"code": "invalid_weight", "side": side, "index": index, "message": f"权重无效：{token.get('raw_text', '')}"})
     positive_names = {str(item.get("raw_text", "")).strip().casefold() for item in document.get("positive_tokens", [])}
-    if "solo" in positive_names and (positive_names & {"1girl", "1boy", "2girls", "2boys", "multiple", "multiple girls", "multiple boys", "hetero", "yuri", "group sex"}):
-        issues.append({"code": "conflicting_count", "message": "solo 不能与多人或性别数量标签同时出现。"})
+    if "solo" in positive_names and (_person_count(positive_names) > 1 or positive_names & _SOLO_CONFLICTS):
+        issues.append({"code": "conflicting_count", "message": "solo 不能与多人或配对标签同时出现。"})
     if "1girl" in positive_names and (positive_names & {"2girls", "multiple girls"}):
         issues.append({"code": "conflicting_count", "message": "1girl 不能与 2girls 或 multiple girls 同时出现。"})
     if "1boy" in positive_names and (positive_names & {"2boys", "multiple boys"}):

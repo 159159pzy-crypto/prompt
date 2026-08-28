@@ -4,7 +4,6 @@ import json
 import re
 import time
 import asyncio
-import logging
 from typing import Any, Callable
 
 import httpx
@@ -13,22 +12,14 @@ from json_repair import repair_json
 from .documents import PROTECTED_RE, canonical_document, validate_document
 from .prompt import split_prompt
 from . import skill_runtime
-from .skills import instructions as skill_instructions, selected_ids as selected_skill_ids
+from .skills import dimension_hints, instructions as skill_instructions, selected_ids as selected_skill_ids
 from .persona import STUDIO_PERSONA
-
-logger = logging.getLogger(__name__)
 
 _CN_NUMBERS = {
     "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
     "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
 }
-_DIMENSION_HINTS = {
-    "clothing-library": ("服装", "衣服", "制服", "裙", "内衣", "穿着", "outfit", "clothing"),
-    "pose-library": ("姿势", "体位", "动作", "pose", "action"),
-    "camera-scene-library": ("镜头", "构图", "场景", "视角", "camera", "composition", "scene"),
-    "appearance-library": ("外貌", "发色", "眼睛", "身体", "头发", "appearance", "hair", "eyes"),
-    "mood-library": ("氛围", "质感", "色调", "天气", "mood", "atmosphere"),
-}
+VARIANT_OVERLAP_LIMIT = 0.5
 
 
 def _chinese_number(value: str) -> int | None:
@@ -53,7 +44,7 @@ def parse_generation_request(intent: str, fallback_count: int = 1) -> dict[str, 
     explicit_count = False
     count: int | None = None
     patterns = (
-        r"(?<![0-9])([0-9]{1,5}|[零一二两三四五六七八九十百]+)\s*(?:组|个|套|份|种|条|prompts?|sets?|variants?)",
+        r"(?<![0-9])([0-9]{1,5}|[零一二两三四五六七八九十百]+)\s*(?:组|套|份|种|条|prompts?|sets?|variants?)",
         r"(?:generate|make|give me|create)\s+([0-9]{1,5})\s+(?:prompts?|sets?|variants?)",
     )
     for pattern in patterns:
@@ -64,7 +55,12 @@ def parse_generation_request(intent: str, fallback_count: int = 1) -> dict[str, 
                 count = parsed
                 explicit_count = True
                 break
-    dimensions = [skill_id for skill_id, hints in _DIMENSION_HINTS.items() if any(hint.casefold() in text.casefold() for hint in hints)]
+    hints = dimension_hints()
+    dimensions = [
+        skill_id
+        for skill_id, triggers in hints.items()
+        if any(skill_runtime._trigger_match(trigger, text) for trigger in triggers)
+    ]
     lowered = text.casefold()
     dedupe_required = bool((count or fallback_count) > 1 or any(word in lowered for word in ("不重复", "不同", "变体", "variation", "distinct", "unique")))
     return {
@@ -83,8 +79,9 @@ async def _agent_parse_request(intent: str, provider: Any, secret: str, fallback
         "Extract generation intent as JSON only. Return exactly these fields: "
         "requested_count (positive integer), explicit_count (boolean), "
         "variation_dimensions (array of skill ids), dedupe_required (boolean). "
-        "If no explicit count is present, use 1. Valid dimensions: clothing-library, "
-        "pose-library, camera-scene-library, appearance-library, mood-library.\nUser: " + intent
+        "If no explicit count is present, use 1. Count people (两个人/五个女孩) as one image, "
+        "not as variant count. Valid dimensions: clothing-library, pose-library, "
+        "camera-scene-library, appearance-library, mood-library, expression-library, special-themes.\nUser: " + intent
     )
     request = {
         # Keep the helper request on the same explicitly selected route as the
@@ -104,7 +101,8 @@ async def _agent_parse_request(intent: str, provider: Any, secret: str, fallback
             count = int(parsed.get("requested_count") or fallback_count or 1)
             if count < 1:
                 return None
-            dimensions = [str(item) for item in parsed.get("variation_dimensions", []) if str(item) in _DIMENSION_HINTS]
+            allowed = dimension_hints()
+            dimensions = [str(item) for item in parsed.get("variation_dimensions", []) if str(item) in allowed]
             return {"requested_count": count, "explicit_count": bool(parsed.get("explicit_count")), "variation_dimensions": dimensions, "dedupe_required": bool(parsed.get("dedupe_required", count > 1))}
     except (httpx.HTTPError, KeyError, TypeError, ValueError, IndexError, json.JSONDecodeError):
         return None
@@ -118,7 +116,7 @@ def _cross_variant_diagnostics(variants: list[dict[str, Any]], dimensions: list[
             shared = token_sets[left] & token_sets[right]
             denominator = max(1, len(token_sets[left] | token_sets[right]))
             overlap = len(shared) / denominator
-            if overlap >= 0.8:
+            if overlap >= VARIANT_OVERLAP_LIMIT:
                 diagnostics.append({"code": "variant_too_similar", "variants": [left + 1, right + 1], "overlap": round(overlap, 3), "dimensions": dimensions})
     return diagnostics
 
@@ -130,7 +128,8 @@ def error(code: str, message: str) -> dict[str, str]:
 DEFAULT_SYSTEM_PROMPT = """You create production-ready Anima image prompts. Return JSON only.
 The canonical output is structured tokens, never a prose-only prompt.
 Each token may be either a string such as {\"raw_text\":\"1girl\",\"weight\":1} or an object with raw_text and weight.
-Prefer the object form. Return positive_tokens only. Do not return negative_tokens or a negative prompt."""
+Prefer the object form. Return positive_tokens only. Do not return negative_tokens or a negative prompt.
+After assembling tokens, call validate_prompt with enforce_quantity=true. Return the final JSON only after it passes."""
 
 TRANSLATION_RULE = (
     "include_chinese is TRUE for this request. You MUST return positive_translations: "
@@ -257,8 +256,8 @@ def _clip(value: Any, limit: int = MAX_TOOL_RESULT_CHARS) -> Any:
 
 def _tool_definitions() -> list[dict[str, Any]]:
     return [
-        {"type": "function", "function": {"name": "list_skills", "description": "List all available read-only repository Skills.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
-        {"type": "function", "function": {"name": "read_skill", "description": "Read one discovered repository Skill instruction body by id.", "parameters": {"type": "object", "properties": {"skill_id": {"type": "string"}}, "required": ["skill_id"], "additionalProperties": False}}},
+        {"type": "function", "function": {"name": "list_skills", "description": "List all available read-only repository Skills and their reference sections.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
+        {"type": "function", "function": {"name": "read_skill", "description": "Read a Skill index, or one reference section when section is set.", "parameters": {"type": "object", "properties": {"skill_id": {"type": "string"}, "section": {"type": "string", "description": "Optional references/<section>.md id"}}, "required": ["skill_id"], "additionalProperties": False}}},
         {"type": "function", "function": {"name": "validate_prompt", "description": "Validate a structured Anima prompt document and return issues.", "parameters": {"type": "object", "properties": {"document": {"type": "object"}, "enforce_quantity": {"type": "boolean"}}, "required": ["document"], "additionalProperties": False}}},
         {"type": "function", "function": {"name": "normalize_prompt", "description": "Normalize a structured Anima prompt document into canonical Token objects.", "parameters": {"type": "object", "properties": {"document": {"type": "object"}}, "required": ["document"], "additionalProperties": False}}},
     ]
@@ -273,13 +272,22 @@ def _tool_read_skill(arguments: dict[str, Any], injected_skill_ids: set[str] | N
     skill_id = str(arguments.get("skill_id") or "").strip()
     if not skill_id:
         raise ValueError("skill_id is required")
-    discovered, diagnostics = skill_runtime.discover()
+    discovered, _diagnostics = skill_runtime.discover()
     skill = next((item for item in discovered if item.id == skill_id), None)
     if skill is None:
         raise ValueError(f"unknown skill: {skill_id}")
-    item = {"id": skill.id, "name": skill.display_name or skill.name, "description": skill.description}
+    sections = [item["id"] for item in skill_runtime.list_sections(skill) if item["available"]]
+    item = {"id": skill.id, "name": skill.display_name or skill.name, "description": skill.description, "sections": sections}
+    section = str(arguments.get("section") or "").strip()
+    if section:
+        return {**item, "section": section, "instruction_injected": False, "instruction": _clip(skill_runtime.load_section(skill, section))}
     if injected_skill_ids and skill.id in injected_skill_ids:
-        return {**item, "instruction_injected": True, "instruction": "该 Skill 已注入当前 system message，无需重复读取。"}
+        hint = "该 Skill 索引已注入当前 system message。"
+        if sections:
+            hint += " 词表请用 section 参数读取：" + ", ".join(sections)
+        else:
+            hint += " 无需重复读取正文。"
+        return {**item, "instruction_injected": True, "instruction": hint}
     return {**item, "instruction_injected": False, "instruction": _clip(skill_runtime.load_instructions(skill))}
 
 
@@ -344,13 +352,9 @@ def validate_variant(raw: dict[str, Any], include_chinese: bool) -> dict[str, An
         "protected_tokens": raw.get("protected_tokens") or [],
         "notes": raw.get("notes") or "",
     })
-    # Final model output always passes through the same deterministic tool semantics.
     normalized = _tool_normalize_prompt({"document": document})["document"]
     document = normalized
-    # Keep response validation structural; quantity bands are enforced by the
-    # explicit document validation endpoint and by the runtime when a request
-    # declares a concrete scene-count contract.
-    issues = _tool_validate_prompt({"document": document, "enforce_quantity": False})["issues"]
+    issues = _tool_validate_prompt({"document": document, "enforce_quantity": True})["issues"]
     if issues:
         raise ValueError("; ".join(issue["message"] for issue in issues))
     if include_chinese:
@@ -361,9 +365,14 @@ def validate_variant(raw: dict[str, Any], include_chinese: bool) -> dict[str, An
         if len(positive_translations) != len(document["positive_tokens"]):
             raise ModelResponseError("token_translation_count_mismatch", "正面中文翻译数量必须与正面 Token 数量一致，不能合并、遗漏或重排。")
         for index, token in enumerate(document["positive_tokens"]):
-            if token.get("locked") or PROTECTED_RE.match(token["raw_text"]):
-                if positive_translations[index] != token["raw_text"]:
-                    raise ModelResponseError("protected_translation_changed", f"受保护 Token 未保持原文：{token['raw_text']}")
+            raw_text = token["raw_text"]
+            translation = positive_translations[index]
+            protected = bool(token.get("locked") or PROTECTED_RE.match(raw_text))
+            if protected:
+                if translation != raw_text:
+                    raise ModelResponseError("protected_translation_changed", f"受保护 Token 未保持原文：{raw_text}")
+            elif translation.casefold() == raw_text.casefold():
+                raise ModelResponseError("token_translation_copied", f"中文翻译不能直接复制英文原文：{raw_text}")
         document["positive_translations"] = positive_translations
         document["chinese_explanation"] = "，".join(positive_translations)
     else:
@@ -373,7 +382,7 @@ def validate_variant(raw: dict[str, Any], include_chinese: bool) -> dict[str, An
     return document
 
 
-async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "", enabled_skills: Any = None, event_sink: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
+async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "", enabled_skills: Any = None, event_sink: Callable[[dict[str, Any]], None] | None = None, repair_note: str = "") -> dict[str, Any]:
     started = time.perf_counter()
     if not provider:
         return {"status": "failed", "engine": "none", "variants": [], "error": error("provider_unavailable", "没有启用的模型供应商，请先在设置中配置。"), "latency_ms": 0}
@@ -419,19 +428,31 @@ async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "
     variation_dimensions = parsed_request["variation_dimensions"]
     dedupe_required = parsed_request["dedupe_required"]
     custom_prompt = str(system_prompt or "").strip()[:12000]
-    system = (custom_prompt + "\n\n" if custom_prompt else STUDIO_PERSONA + "\n\n") + DEFAULT_SYSTEM_PROMPT + "\n"
+    system = (custom_prompt + "\n\n" if custom_prompt else "") + STUDIO_PERSONA + "\n\n" + DEFAULT_SYSTEM_PROMPT + "\n"
     if body.include_chinese:
         system += TRANSLATION_RULE + "\n"
-    skill_state = {**(enabled_skills if isinstance(enabled_skills, dict) else {}), "__mode": "compact", "__intent": body.intent, "__requested_count": requested_count, "__variation_dimensions": variation_dimensions, "__dedupe_required": dedupe_required}
+    skill_state = dict(enabled_skills) if isinstance(enabled_skills, dict) else {}
+    skill_state["__mode"] = "compact"
+    skill_state["__intent"] = skill_state.get("__intent") or (
+        f"{body.intent} {(body.current_document or {}).get('modification_request') or ''}".strip()
+        if getattr(body, "mode", "create") == "modify"
+        else body.intent
+    )
+    skill_state["__requested_count"] = requested_count
+    skill_state["__variation_dimensions"] = variation_dimensions
+    skill_state["__dedupe_required"] = dedupe_required
+    if "__explicit_skill_ids" not in skill_state:
+        skill_state["__explicit_skill_ids"] = list((body.current_document or {}).get("_explicit_skill_ids") or [])
     actual_skill_ids = selected_skill_ids(skill_state)
     injected_skill_ids = set(actual_skill_ids)
-    if enabled_skills:
-        rendered = skill_instructions(skill_state)
-        if rendered:
-            system += "\nApply these selected repository Skills for this request:\n" + "\n\n".join(rendered) + "\n"
+    rendered = skill_instructions(skill_state)
+    if rendered:
+        system += "\nApply these selected repository Skills for this request:\n" + "\n\n".join(rendered) + "\n"
     if dedupe_required:
         system += "\nThis request requires distinct variants. Vary the requested semantic dimensions and avoid repeating core tags across variants; do not collapse variants into one.\n"
-    system += "\nSelected Skill instructions are already present above. Do not call read_skill for an injected Skill unless you need to verify its metadata. You may call other read-only tools when useful. Always return final JSON with variants after tool work.\n"
+    if repair_note:
+        system += "\n" + repair_note.strip() + "\n"
+    system += "\nSelected Skill indexes are already present above. Call read_skill with section to load a tag catalog. Call validate_prompt with enforce_quantity=true before the final JSON. Always return final JSON with variants after tool work.\n"
     system += f"Return this shape: {json.dumps(schema, ensure_ascii=False)}"
     selected_model = body.model or provider["model"]
     completion_limit = int(provider["max_tokens"])
@@ -525,8 +546,11 @@ async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "
                     variants = [validate_variant(item, body.include_chinese) for item in raw_variants[:requested_count]]
                     if not variants:
                         raise ModelResponseError("provider_schema_invalid", "模型没有返回有效候选。")
+                    diagnostics = _cross_variant_diagnostics(variants, variation_dimensions) if requested_count > 1 else []
+                    if diagnostics:
+                        raise ModelResponseError("variant_too_similar", "; ".join(item["code"] + " variants " + str(item["variants"]) for item in diagnostics))
                 except (ModelResponseError, KeyError, TypeError, ValueError) as exc:
-                    retry_note = f"Return exactly {requested_count} complete variants in one JSON object. Follow the required schema and preserve exact token counts."
+                    retry_note = f"Return exactly {requested_count} complete variants in one JSON object. Follow the required schema, quantity band, and keep variant overlap below {VARIANT_OVERLAP_LIMIT}."
                     messages.extend([
                         {"role": "assistant", "content": content[:12000]},
                         {"role": "user", "content": f"Your response failed validation: {str(exc)[:500]} {retry_note}"},
@@ -536,10 +560,7 @@ async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "
                     raise
                 input_tokens, output_tokens = _usage_tokens(last_usage)
                 emit({"event_type": "final", "round": round_index + 1, "status": "completed"})
-                diagnostics = _cross_variant_diagnostics(variants, variation_dimensions) if requested_count > 1 else []
-                if diagnostics:
-                    logger.warning("cross-variant diagnostics: %s", diagnostics)
-                return {"status": "completed", "engine": "openai-compatible", "variants": variants, "error": None, "latency_ms": int((time.perf_counter() - started) * 1000), "input_tokens": input_tokens, "output_tokens": output_tokens, "tool_trace": trace, "selected_skill_ids": actual_skill_ids, "variant_diagnostics": diagnostics}
+                return {"status": "completed", "engine": "openai-compatible", "variants": variants, "error": None, "latency_ms": int((time.perf_counter() - started) * 1000), "input_tokens": input_tokens, "output_tokens": output_tokens, "tool_trace": trace, "selected_skill_ids": actual_skill_ids, "variant_diagnostics": []}
             raise ModelResponseError("agent_loop_limit", f"Agent 超过最大循环轮数 {MAX_AGENT_ROUNDS}。")
     except ModelResponseError as exc:
         run_error = error(exc.code, str(exc))

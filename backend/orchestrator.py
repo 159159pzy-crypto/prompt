@@ -49,8 +49,11 @@ async def run_pipeline(body: Any, provider: Any, secret: str, system_prompt: str
             validated.append(validate_variant(variant, bool(getattr(body, "include_chinese", False))))
     except Exception as exc:
         emit({"event_type": "stage", "stage": "validator", "step_id": "validator", "status": "failed", "error": {"code": "validator_failed", "message": str(exc)[:500]}})
-        repair_prompt = system_prompt + "\nRepair the candidate output so every variant passes deterministic validation. Return only the complete JSON schema."
-        repaired = await generate_agent(body, provider, secret, repair_prompt, enabled_skills, event_sink=lambda event: emit({**event, "stage": "validator", "step_id": "validator", "attempt": 2}))
+        repaired = await generate_agent(
+            body, provider, secret, system_prompt, enabled_skills,
+            event_sink=lambda event: emit({**event, "stage": "validator", "step_id": "validator", "attempt": 2}),
+            repair_note=f"Repair the candidate output so every variant passes deterministic validation: {str(exc)[:500]}. Return only the complete JSON schema.",
+        )
         if repaired.get("status") != "completed":
             return repaired
         try:
