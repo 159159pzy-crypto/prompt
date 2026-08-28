@@ -8,6 +8,7 @@ from backend import db
 from backend import agent
 from backend.app import app
 from backend.documents import validate_document
+from backend.persona import STUDIO_PERSONA
 from backend.skills import build_skill_state, catalog, instructions, selected_ids
 from backend import skill_runtime
 from backend import run_store, worker
@@ -367,6 +368,10 @@ def test_model_output_is_validated_and_never_falls_back(tmp_path, monkeypatch):
         assert FakeClient.requests[-1]["json"]["reasoning_effort"] == "high"
         assert FakeClient.requests[-1]["json"]["max_completion_tokens"] == 4096
         assert "max_tokens" not in FakeClient.requests[-1]["json"]
+        system = FakeClient.requests[-1]["json"]["messages"][0]["content"]
+        assert "Before returning any JSON, you MUST call validate_prompt with enforce_quantity=true" in system
+        assert "单人展示 16-30" in system
+        assert "不能把 R-18 指定压成全年齢" in system
 
         monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **_kwargs: FakeClient("not json"))
         invalid = client.post("/api/generate", json={"intent": "再次生成"}).json()
@@ -761,6 +766,23 @@ def test_solo_plus_one_girl_is_valid_and_two_girls_is_not_complex():
     sex = {"intent": "two-person sex", "positive_tokens": [{"raw_text": "1girl"}, {"raw_text": "1boy"}, {"raw_text": "sex"}], "negative_tokens": []}
     sex_quantity = next(issue for issue in validate_document(sex, enforce_quantity=True) if issue["code"] == "quantity_out_of_range")
     assert sex_quantity["band"] == "standard"
+
+
+def test_persona_hardens_quantity_gaze_rating_and_translation_rules():
+    assert "单人展示 16-30" in STUDIO_PERSONA
+    assert "双人色情/前戏 22-38" in STUDIO_PERSONA
+    assert "三人及以上 30-48" in STUDIO_PERSONA
+    assert "2girls 闲聊走 16-30" in STUDIO_PERSONA
+    assert "validate_prompt(document, enforce_quantity=true)" in STUDIO_PERSONA
+    assert "direct eye contact, facing viewer" in STUDIO_PERSONA
+    assert "睡奸/失神/隐奸" in STUDIO_PERSONA
+    assert "日常/展示=全年齢" in STUDIO_PERSONA
+    assert "明确性行为=R-18 指定" in STUDIO_PERSONA
+    assert "不能把 R-18 指定压成全年齢" in STUDIO_PERSONA
+    assert "至少拉开 3 个维度" in STUDIO_PERSONA
+    assert "overlap ≥ 0.5" in STUDIO_PERSONA
+    assert "不得把英文原文复制为译文" in STUDIO_PERSONA
+    assert "Before returning any JSON, you MUST call validate_prompt" in agent.DEFAULT_SYSTEM_PROMPT
 
 
 def test_people_count_is_not_variant_count():

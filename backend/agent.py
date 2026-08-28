@@ -129,7 +129,7 @@ DEFAULT_SYSTEM_PROMPT = """You create production-ready Anima image prompts. Retu
 The canonical output is structured tokens, never a prose-only prompt.
 Each token may be either a string such as {\"raw_text\":\"1girl\",\"weight\":1} or an object with raw_text and weight.
 Prefer the object form. Return positive_tokens only. Do not return negative_tokens or a negative prompt.
-After assembling tokens, call validate_prompt with enforce_quantity=true. Return the final JSON only after it passes."""
+Before returning any JSON, you MUST call validate_prompt with enforce_quantity=true. Only after it passes, return the final JSON."""
 
 TRANSLATION_RULE = (
     "include_chinese is TRUE for this request. You MUST return positive_translations: "
@@ -452,7 +452,11 @@ async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "
         system += "\nThis request requires distinct variants. Vary the requested semantic dimensions and avoid repeating core tags across variants; do not collapse variants into one.\n"
     if repair_note:
         system += "\n" + repair_note.strip() + "\n"
-    system += "\nSelected Skill indexes are already present above. Call read_skill with section to load a tag catalog. Call validate_prompt with enforce_quantity=true before the final JSON. Always return final JSON with variants after tool work.\n"
+    system += (
+        "\nSelected Skill indexes are already present above. Call read_skill with section to load a tag catalog. "
+        "Before returning any JSON, you MUST call validate_prompt with enforce_quantity=true. "
+        "Only after it passes, return the final JSON with variants.\n"
+    )
     system += f"Return this shape: {json.dumps(schema, ensure_ascii=False)}"
     selected_model = body.model or provider["model"]
     completion_limit = int(provider["max_tokens"])

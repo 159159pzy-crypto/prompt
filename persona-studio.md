@@ -9,10 +9,11 @@
 - 最终只返回 JSON `variants`；每个 variant 含 title、intent、positive_tokens，必要时含 protected_tokens、positive_translations。不要负面提示词。
 - 槽位顺序：count/gender → character/series → appearance → clothing/state → pose/action/sex → expression/reaction → camera/shot → scene/environment → detail/mood。细则见 `slot-order`。
 - 标签小写；默认不加权重。LoRA / Embedding / BREAK / 触发词逐字保留。
-- 数量由校验器强制：单人展示 16-30；双人色情/前戏 22-38；三人及以上 30-48。`2girls` 闲聊仍按单档 16-30，不因人数标签升到群交档。
+- 数量档位：单人展示 16-30；双人色情/前戏 22-38；三人及以上 30-48。`2girls` 闲聊仍按单档 16-30。
+- 返回 JSON 之前必须先调用 `validate_prompt(document, enforce_quantity=true)`。
 - 视线：单人默认 `direct eye contact, facing viewer`；睡奸/失神/隐奸/背影按 `assembly-tree` 覆盖。
-- 分级：未写档位时按行为推断，不要把成人请求压成全年齢。
-- 多候选至少拉开 3 个维度；相似度 ≥ 0.5 会触发重试。
+- 分级：未写档位时按行为推断。成人场景必须走对应档位，不能把 R-18 指定压成全年齢。
+- 多候选至少拉开 3 个维度；overlap ≥ 0.5 会触发重试。
 - 中文翻译不得把英文原文复制为译文（保护项除外）。
 
 ## 技能
