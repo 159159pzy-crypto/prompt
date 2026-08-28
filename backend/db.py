@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 DB_PATH = DATA / "workbench.sqlite3"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def now() -> str:
@@ -148,6 +148,39 @@ def _create_schema(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE providers ADD COLUMN models_json TEXT NOT NULL DEFAULT '[]'")
     if "models_synced_at" not in columns:
         db.execute("ALTER TABLE providers ADD COLUMN models_synced_at TEXT NOT NULL DEFAULT ''")
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            title_source TEXT NOT NULL DEFAULT 'intent',
+            pinned INTEGER NOT NULL DEFAULT 0,
+            archived_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_conversations_updated
+            ON conversations(pinned DESC, updated_at DESC);
+        """
+    )
+    document_columns = {row["name"] for row in db.execute("PRAGMA table_info(prompt_documents)")}
+    if "conversation_id" not in document_columns:
+        db.execute("ALTER TABLE prompt_documents ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''")
+    if "variant_index" not in document_columns:
+        db.execute("ALTER TABLE prompt_documents ADD COLUMN variant_index INTEGER NOT NULL DEFAULT 0")
+    db.execute(
+        """
+        INSERT OR IGNORE INTO conversations (id, title, title_source, pinned, archived_at, created_at, updated_at)
+        SELECT id, intent, 'intent', 0, '', created_at, created_at
+        FROM (
+          SELECT conversation_id AS id, intent, created_at,
+                 ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY revision DESC) AS rn
+          FROM agent_runs
+          WHERE conversation_id <> ''
+        )
+        WHERE rn = 1
+        """
+    )
     db.execute(
         "INSERT OR REPLACE INTO schema_meta(key,value) VALUES('version',?)",
         (str(SCHEMA_VERSION),),

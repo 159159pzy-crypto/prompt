@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#f5f5f7">
-  <title>Agent Studio · 双语生成工作区</title>
+  <title>Prompt Workbench · v7</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -15,7 +15,7 @@
         <div class="brandbar">
           <div class="brand">
             <span class="mark" aria-hidden="true">A</span>
-            <div><strong>Agent Studio</strong><small>结构化生成工作区</small></div>
+            <div><strong>Prompt Workbench</strong><small>v7 · 本地提示词工作台</small></div>
           </div>
           <button class="more-actions" id="moreActions" type="button" aria-label="更多操作" aria-haspopup="menu" aria-expanded="false">•••</button>
           <div class="workspace-menu" id="workspaceMenu" role="menu" hidden>
@@ -25,7 +25,12 @@
         </div>
 
         <button class="new-chat" id="newChat" type="button">＋ 新开对话</button>
-        <p class="section-label">最近对话</p>
+        <label class="sr-only" for="conversationSearch">搜索对话</label>
+        <input class="conversation-search" id="conversationSearch" type="search" placeholder="搜索对话" autocomplete="off">
+        <div class="section-label-row">
+          <p class="section-label">最近对话</p>
+          <button class="copy-link" id="loadMoreConversations" type="button" hidden>加载更多</button>
+        </div>
         <div class="conversation-list" id="conversationList">
           <div class="sidebar-empty">正在载入历史记录…</div>
         </div>
@@ -64,6 +69,10 @@
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.2 5.1L20 10l-4.1 3.7L17 19l-5-2.8L7 19l1.1-5.3L4 10l5.8-1.9L12 3Z"/></svg>
               Skills
             </button>
+            <button class="tree-item" type="button" data-view="documents">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4h7l4 4v12H7z"/><path d="M14 4v4h4"/></svg>
+              文档库
+            </button>
           </div>
         </div>
 
@@ -97,6 +106,9 @@
             </div>
 
             <div class="run-message" id="runMessage" role="status" hidden><span id="runMessageText"></span><button class="copy-link" id="cancelRun" type="button" hidden>取消</button><button class="copy-link" id="retryRun" type="button" hidden>重试</button></div>
+            <div class="run-inspector" id="runInspector" hidden>
+              <p class="inspector-empty">生成后将在这里显示阶段、工具调用和用量</p>
+            </div>
             <div class="result-head">
               <div><h2>生成结果</h2><span class="result-meta" id="resultMeta">等待输入画面描述</span></div>
               <div class="result-actions"><label class="sr-only" for="versionSelect">历史版本</label><select class="version-select" id="versionSelect" hidden></select><button class="copy-link copy-all" id="copyAll" type="button" hidden>复制全部英文</button></div>
@@ -129,7 +141,18 @@
           <section class="view settings-view" data-view-panel="provider" hidden>
             <p class="eyebrow">PROVIDERS</p>
             <h2>供应商</h2>
-            <p class="settings-intro">启用或停用已有模型连接。凭据仍只保留在本地安全存储中。</p>
+            <p class="settings-intro">在本机添加 OpenAI 兼容连接。密钥写入 Windows 凭据存储，界面在保存后不再显示。</p>
+            <div class="setting-panel provider-create">
+              <label class="setting-row" for="providerName"><span><strong>名称</strong></span><input class="select" id="providerName" type="text" placeholder="例如 DeepSeek"></label>
+              <label class="setting-row" for="providerBaseUrl"><span><strong>API 地址</strong><small>OpenAI 兼容 /v1 根路径，不是本机绑定地址</small></span><input class="select" id="providerBaseUrl" type="url" placeholder="https://api.example.com/v1"></label>
+              <label class="setting-row" for="providerModel"><span><strong>默认模型</strong></span><input class="select" id="providerModel" type="text" placeholder="可选"></label>
+              <label class="setting-row" for="providerKey"><span><strong>API key</strong></span><input class="select" id="providerKey" type="password" autocomplete="off" placeholder="保存后不再显示"></label>
+              <label class="setting-row" for="providerEnv"><span><strong>环境变量名</strong><small>可选，优先于粘贴的 key</small></span><input class="select" id="providerEnv" type="text" placeholder="ANIMA_..."></label>
+              <div class="settings-actions">
+                <label class="copy-link import-json"><input id="providerImport" type="file" accept="application/json,.json" hidden>导入 JSON</label>
+                <button class="generate" id="providerCreate" type="button"><span>添加供应商</span></button>
+              </div>
+            </div>
             <div class="setting-panel dynamic-panel" id="providerRows"><div class="settings-empty">正在载入供应商…</div></div>
           </section>
 
@@ -179,11 +202,18 @@
             </label>
             <div class="setting-panel dynamic-panel skills-panel" id="skillsRows"><div class="settings-empty">正在载入 Skills…</div></div>
           </section>
+
+          <section class="view settings-view" data-view-panel="documents" hidden>
+            <p class="eyebrow">DOCUMENTS</p>
+            <h2>文档库</h2>
+            <p class="settings-intro">显式保存的成品。生成成功不会自动写入。可从文档恢复为下一次修改的基线。</p>
+            <div class="setting-panel dynamic-panel" id="documentRows"><div class="settings-empty">正在载入文档…</div></div>
+          </section>
         </div>
       </main>
     </div>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="/static/app.js?v=20260827-4"></script>
+  <script type="module" src="/static/app.js?v=20260828-v7"></script>
 </body>
 </html>

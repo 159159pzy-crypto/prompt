@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import asyncio
 import json
 import pytest
 
@@ -38,11 +39,25 @@ def client_for(tmp_path, monkeypatch):
         yield client
 
 
+def legal_variants(count=1, tokens=None):
+    payload = tokens or SIMPLE_TOKENS
+    return [{"title": f"v{index + 1}", "intent": "雨夜", "positive_tokens": [{"raw_text": item} for item in payload]} for index in range(count)]
+
+
+def accept_agent_kwargs(fn):
+    async def wrapped(body, provider, secret, system_prompt, enabled_skills, event_sink=None, repair_note=""):
+        return await fn(body, provider, secret, system_prompt, enabled_skills)
+    return wrapped
+
+
 def test_fresh_schema_contains_only_core_tables(tmp_path, monkeypatch):
     with client_for(tmp_path, monkeypatch) as client:
-        assert client.get("/api/status").json()["schema_version"] == 4
+        status = client.get("/api/status").json()
+        assert status["schema_version"] == 5
+        assert status["version"] == "7.0.0"
+        assert status["product"] == "Prompt Workbench"
         tables = {row[0] for row in db.connect().execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        assert tables == {"schema_meta", "prompt_documents", "prompt_versions", "agent_runs", "agent_events", "providers", "settings"}
+        assert tables == {"schema_meta", "prompt_documents", "prompt_versions", "agent_runs", "agent_events", "providers", "settings", "conversations"}
 
 
 def test_generate_without_provider_is_explicit_failure(tmp_path, monkeypatch):
@@ -58,17 +73,20 @@ def test_generate_without_provider_is_explicit_failure(tmp_path, monkeypatch):
 def test_generate_modify_keeps_conversation_and_versions(tmp_path, monkeypatch):
     captured = []
 
-    async def fake_generate(body, provider, secret, system_prompt, enabled_skills):
+    async def fake_generate(body, provider, secret, system_prompt, enabled_skills, event_sink=None, repair_note=""):
         captured.append(body)
         return {
             "status": "completed",
             "engine": "fake",
-            "variants": [{"title": "v", "intent": body.intent, "positive_tokens": [{"raw_text": f"token-{index}"} for index in range(16)]}],
+            "variants": legal_variants(1),
             "error": None,
             "latency_ms": 1,
+            "input_tokens": 2,
+            "output_tokens": 4,
         }
 
-    monkeypatch.setattr("backend.app.generate_agent", fake_generate)
+    monkeypatch.setattr("backend.agent.generate", fake_generate)
+    monkeypatch.setattr("backend.orchestrator.generate_agent", fake_generate)
     monkeypatch.setattr("backend.app._provider_secret", lambda _provider: "test-secret")
     with client_for(tmp_path, monkeypatch) as client:
         provider = client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test"}).json()
@@ -97,12 +115,13 @@ def test_generate_modify_keeps_conversation_and_versions(tmp_path, monkeypatch):
 def test_runtime_system_prompt_is_forwarded_to_agent(tmp_path, monkeypatch):
     captured = {}
 
-    async def fake_generate(body, provider, secret, system_prompt, enabled_skills):
+    async def fake_generate(body, provider, secret, system_prompt, enabled_skills, event_sink=None, repair_note=""):
         captured["system_prompt"] = system_prompt
         captured["enabled_skills"] = enabled_skills
         return {"status": "failed", "engine": "none", "variants": [], "error": {"code": "test", "message": "captured"}, "latency_ms": 0}
 
-    monkeypatch.setattr("backend.app.generate_agent", fake_generate)
+    monkeypatch.setattr("backend.agent.generate", fake_generate)
+    monkeypatch.setattr("backend.orchestrator.generate_agent", fake_generate)
     with client_for(tmp_path, monkeypatch) as client:
         client.put("/api/settings/runtime", json={"system_prompt": "只生成夜景，并保持结构化 Token。"})
         response = client.post("/api/generate", json={"intent": "夜景"})
@@ -114,12 +133,13 @@ def test_runtime_system_prompt_is_forwarded_to_agent(tmp_path, monkeypatch):
 def test_semantic_count_is_forwarded_and_relevant_skills_are_selected(tmp_path, monkeypatch):
     captured = {}
 
-    async def fake_generate(body, provider, secret, system_prompt, enabled_skills):
+    async def fake_generate(body, provider, secret, system_prompt, enabled_skills, event_sink=None, repair_note=""):
         captured["count"] = body.requested_count
         captured["skills"] = enabled_skills["__selected_skill_ids"]
-        return {"status": "completed", "engine": "fake", "variants": [{"title": str(i)} for i in range(body.requested_count)], "error": None, "latency_ms": 1}
+        return {"status": "completed", "engine": "fake", "variants": legal_variants(body.requested_count), "error": None, "latency_ms": 1}
 
-    monkeypatch.setattr("backend.app.generate_agent", fake_generate)
+    monkeypatch.setattr("backend.agent.generate", fake_generate)
+    monkeypatch.setattr("backend.orchestrator.generate_agent", fake_generate)
     monkeypatch.setattr("backend.app._provider_secret", lambda _provider: "test-secret")
     with client_for(tmp_path, monkeypatch) as client:
         provider = client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test"}).json()
@@ -210,6 +230,8 @@ async def test_worker_executes_queued_run_and_persists_result(tmp_path, monkeypa
         status = client.get(f"/api/runs/{created['run_id']}").json()
         assert status["status"] == "completed"
         assert [item["raw_text"] for item in status["result"]["variants"][0]["positive_tokens"][:2]] == ["1girl", "solo"]
+        assert status["usage"]["input_tokens"] == 2
+        assert status["usage"]["output_tokens"] == 4
         assert len(client.get(f"/api/runs/{created['run_id']}/events").json()["items"]) >= 4
 
 
@@ -503,7 +525,11 @@ def test_agent_tool_loop_persists_trace_and_exposes_tools(tmp_path, monkeypatch)
         assert result["status"] == "completed"
         assert result["tool_trace"][1]["tool_name"] == "list_skills"
         trace = client.get(f"/api/agent-runs/{result['id']}/trace").json()
-        assert [item["event_type"] for item in trace["items"]] == ["model_request", "tool_call", "model_request", "final"]
+        types = [item["event_type"] for item in trace["items"]]
+        assert types.count("model_request") >= 2
+        assert "tool_call" in types
+        assert "final" in types
+        assert "stage" in types
         assert "tools" in fake.requests[0]["json"]
 
 
@@ -601,11 +627,12 @@ def test_generation_uses_explicit_provider_selection(tmp_path, monkeypatch):
     monkeypatch.setenv("ANIMA_TWO_KEY", "two")
     captured = {}
 
-    async def fake_generate(body, provider, secret, system_prompt, enabled_skills):
+    async def fake_generate(body, provider, secret, system_prompt, enabled_skills, event_sink=None, repair_note=""):
         captured.update(provider_id=provider["id"], model=body.model, effort=body.reasoning_effort, secret=secret)
-        return {"status": "completed", "engine": "test", "variants": [{"title": "ok"}], "error": None, "latency_ms": 1}
+        return {"status": "completed", "engine": "test", "variants": legal_variants(1), "error": None, "latency_ms": 1}
 
-    monkeypatch.setattr("backend.app.generate_agent", fake_generate)
+    monkeypatch.setattr("backend.agent.generate", fake_generate)
+    monkeypatch.setattr("backend.orchestrator.generate_agent", fake_generate)
     with client_for(tmp_path, monkeypatch) as client:
         first = client.post("/api/providers", json={"name": "One", "base_url": "https://one.example/v1", "model": "model-one", "env_name": "ANIMA_ONE_KEY"}).json()
         second = client.post("/api/providers", json={"name": "Two", "base_url": "https://two.example/v1", "model": "model-two", "env_name": "ANIMA_TWO_KEY"}).json()
@@ -712,12 +739,13 @@ def test_codex_skill_api_toggle_and_generation_selection(tmp_path, monkeypatch):
     monkeypatch.setattr(skill_runtime, "REPO_ROOT", tmp_path)
     captured = {}
 
-    async def fake_generate(body, provider, secret, system_prompt, enabled_skills):
+    async def fake_generate(body, provider, secret, system_prompt, enabled_skills, event_sink=None, repair_note=""):
         captured["intent"] = body.intent
         captured["enabled_skills"] = enabled_skills
         return {"status": "failed", "engine": "none", "variants": [], "error": {"code": "test", "message": "captured"}, "latency_ms": 0}
 
-    monkeypatch.setattr("backend.app.generate_agent", fake_generate)
+    monkeypatch.setattr("backend.agent.generate", fake_generate)
+    monkeypatch.setattr("backend.orchestrator.generate_agent", fake_generate)
     with client_for(tmp_path, monkeypatch) as client:
         listed = client.get("/api/skills").json()
         assert next(item for item in listed["items"] if item["id"] == "demo")["source"] == "codex"
@@ -834,3 +862,198 @@ def test_deepseek_sandbox_is_opt_in_only():
     assert "deepseek-unrestricted" not in selected_ids({"__mode": "compact", "__intent": "破甲测试无限制"})
     explicit = selected_ids({"__mode": "compact", "__intent": "$deepseek-unrestricted"})
     assert "deepseek-unrestricted" in explicit
+
+
+GENERATE_KEYS = {
+    "id", "status", "engine", "provider_id", "model", "reasoning_effort",
+    "variants", "error", "selected_skill_ids", "skill_diagnostics",
+    "variant_diagnostics", "tool_trace", "usage", "conversation_id",
+    "parent_run_id", "revision", "mode",
+}
+
+
+def test_schema_v4_file_migrates_without_dropping_runs(tmp_path, monkeypatch):
+    db_path = tmp_path / "workbench.sqlite3"
+    monkeypatch.setattr(db, "DATA", tmp_path)
+    monkeypatch.setattr(db, "DB_PATH", db_path)
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE prompt_documents (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, intent TEXT NOT NULL DEFAULT '',
+            positive_tokens TEXT NOT NULL DEFAULT '[]', negative_tokens TEXT NOT NULL DEFAULT '[]',
+            protected_tokens TEXT NOT NULL DEFAULT '[]', notes TEXT NOT NULL DEFAULT '',
+            source_run_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE prompt_versions (
+            id TEXT PRIMARY KEY, prompt_id TEXT NOT NULL, snapshot_json TEXT NOT NULL,
+            reason TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE agent_runs (
+            id TEXT PRIMARY KEY, intent TEXT NOT NULL, request_json TEXT NOT NULL DEFAULT '{}',
+            response_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL, error_json TEXT NOT NULL DEFAULT '{}',
+            engine TEXT NOT NULL DEFAULT '', latency_ms INTEGER, created_at TEXT NOT NULL,
+            conversation_id TEXT NOT NULL DEFAULT '', parent_run_id TEXT NOT NULL DEFAULT '',
+            revision INTEGER NOT NULL DEFAULT 1, mode TEXT NOT NULL DEFAULT 'create'
+        );
+        CREATE TABLE agent_events (
+            id TEXT PRIMARY KEY, run_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+            event_type TEXT NOT NULL, tool_name TEXT NOT NULL DEFAULT '', arguments_json TEXT NOT NULL DEFAULT '{}',
+            result_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT '', latency_ms INTEGER,
+            error_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, step_id TEXT NOT NULL DEFAULT '',
+            attempt INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE providers (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL,
+            temperature REAL NOT NULL DEFAULT 0.7, max_tokens INTEGER NOT NULL DEFAULT 4096,
+            timeout INTEGER NOT NULL DEFAULT 120, enabled INTEGER NOT NULL DEFAULT 1,
+            secret_ref TEXT NOT NULL DEFAULT '', models_json TEXT NOT NULL DEFAULT '[]',
+            models_synced_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE settings (key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL);
+        INSERT INTO schema_meta VALUES ('version', '4');
+        INSERT INTO prompt_documents VALUES ('doc-1','Rain','intent','[]','[]','[]','','','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00');
+        INSERT INTO agent_runs (id,intent,request_json,response_json,status,error_json,engine,created_at,conversation_id,revision,mode)
+            VALUES ('run-1','雨夜','{}','{}','completed','{}','','2026-01-01T00:00:00+00:00','run-1',1,'create');
+        """
+    )
+    conn.commit()
+    conn.close()
+    db.init_db()
+    with TestClient(app) as client:
+        assert client.get("/api/status").json()["schema_version"] == 5
+        assert db.connect().execute("SELECT id FROM agent_runs WHERE id='run-1'").fetchone()[0] == "run-1"
+        columns = {row["name"] for row in db.connect().execute("PRAGMA table_info(prompt_documents)")}
+        assert {"conversation_id", "variant_index"} <= columns
+        created = client.post("/api/documents", json={"title": "New", "positive_tokens": [{"raw_text": "1girl"}]}).json()
+        assert created["id"]
+        assert client.get("/api/conversations").json()["total"] >= 1
+
+
+def test_conversations_list_rename_pin_and_hard_delete(tmp_path, monkeypatch):
+    async def fake_generate(body, provider, secret, system_prompt, enabled_skills, event_sink=None, repair_note=""):
+        return {"status": "completed", "engine": "fake", "variants": legal_variants(1), "error": None, "latency_ms": 1}
+
+    monkeypatch.setattr("backend.agent.generate", fake_generate)
+    monkeypatch.setattr("backend.orchestrator.generate_agent", fake_generate)
+    monkeypatch.setattr("backend.app._provider_secret", lambda _provider: "test-secret")
+    with client_for(tmp_path, monkeypatch) as client:
+        provider = client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test"}).json()
+        first = client.post("/api/generate", json={"intent": "雨夜东京街头", "provider_id": provider["id"]}).json()
+        listed = client.get("/api/conversations").json()
+        assert listed["total"] == 1
+        conversation_id = first["conversation_id"]
+        renamed = client.patch(f"/api/conversations/{conversation_id}", json={"title": "夜景"}).json()
+        assert renamed["title"] == "夜景"
+        assert renamed["title_source"] == "user"
+        pinned = client.patch(f"/api/conversations/{conversation_id}", json={"pinned": True}).json()
+        assert pinned["pinned"] is True
+        runs = client.get(f"/api/conversations/{conversation_id}/runs").json()["items"]
+        assert "request_json" not in runs[0]
+        assert runs[0]["variant_count"] == 1
+        saved = client.post("/api/documents", json={"title": "keep", "intent": "雨夜", "positive_tokens": [{"raw_text": item} for item in SIMPLE_TOKENS], "conversation_id": conversation_id}).json()
+        deleted = client.delete(f"/api/conversations/{conversation_id}")
+        assert deleted.json()["deleted"] is True
+        assert client.get("/api/conversations").json()["total"] == 0
+        assert client.get(f"/api/documents/{saved['id']}").status_code == 200
+
+
+def test_empty_api_key_put_keeps_secret(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANIMA_KEEP_KEY", "kept-secret")
+    with client_for(tmp_path, monkeypatch) as client:
+        created = client.post("/api/providers", json={"name": "keep", "base_url": "http://model.local/v1", "model": "test", "env_name": "ANIMA_KEEP_KEY"}).json()
+        assert "api_key" not in created
+        assert created["has_api_key"] is True
+        updated = client.put(f"/api/providers/{created['id']}", json={"name": "keep", "base_url": "http://model.local/v1", "model": "test", "api_key": "", "env_name": "ANIMA_KEEP_KEY", "max_tokens": 2048}).json()
+        assert updated["max_tokens"] == 2048
+        assert "api_key" not in updated
+        from backend.app import _provider, _provider_secret
+        assert _provider_secret(_provider(created["id"])) == "kept-secret"
+
+
+def test_document_lint_and_delete(tmp_path, monkeypatch):
+    with client_for(tmp_path, monkeypatch) as client:
+        lint = client.post("/api/documents/lint", json={"intent": "单人展示", "positive_tokens": [{"raw_text": "solo"}]}).json()
+        warning = next(issue for issue in lint["issues"] if issue["code"] == "quantity_out_of_range")
+        assert warning["severity"] == "warning"
+        assert lint["band"]["label"] == "simple"
+        created = client.post("/api/documents", json={"title": "x", "positive_tokens": [{"raw_text": "1girl"}]}).json()
+        assert client.delete(f"/api/documents/{created['id']}").json()["deleted"] is True
+        assert client.get(f"/api/documents/{created['id']}").status_code == 404
+
+
+def test_generate_json_keys_and_busy_conversation(tmp_path, monkeypatch):
+    async def fake_generate(body, provider, secret, system_prompt, enabled_skills, event_sink=None, repair_note=""):
+        return {"status": "completed", "engine": "fake", "variants": legal_variants(1), "error": None, "latency_ms": 1, "selected_skill_ids": ["anima-tags"]}
+
+    monkeypatch.setattr("backend.agent.generate", fake_generate)
+    monkeypatch.setattr("backend.orchestrator.generate_agent", fake_generate)
+    monkeypatch.setattr("backend.app._provider_secret", lambda _provider: "test-secret")
+    with client_for(tmp_path, monkeypatch) as client:
+        provider = client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test"}).json()
+        result = client.post("/api/generate", json={"intent": "雨夜女孩", "provider_id": provider["id"]}).json()
+        assert GENERATE_KEYS <= set(result)
+        assert result["id"] == result["conversation_id"]
+        queued = client.post("/api/runs", json={"intent": "排队", "conversation_id": result["conversation_id"], "provider_id": provider["id"]})
+        assert queued.status_code == 202
+        busy = client.post("/api/generate", json={"intent": "冲突", "conversation_id": result["conversation_id"], "provider_id": provider["id"]})
+        assert busy.status_code == 409
+        assert busy.json()["detail"] == "conversation already has an active run"
+
+
+def test_skills_intent_query_explains_clothing_dimension(tmp_path, monkeypatch):
+    with client_for(tmp_path, monkeypatch) as client:
+        explained = client.get("/api/skills", params={"intent": "给我生成5组不同服装"}).json()
+        clothing = next(item for item in explained["items"] if item["id"] == "clothing-library")
+        assert clothing["selected"] is True
+        assert clothing["selection_reason"] in {"dimension", "trigger"}
+        assert "clothing-library" in explained["selected_skill_ids"]
+        sandbox = next(item for item in explained["items"] if item["id"] == "deepseek-unrestricted")
+        assert sandbox["selected"] is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_prevents_second_claim(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_store, "LEASE_SECONDS", 1)
+    monkeypatch.setenv("ANIMA_TEST_KEY", "test-only")
+
+    async def slow_generate(body, provider, secret, system_prompt, enabled_skills, event_sink=None, repair_note=""):
+        await asyncio.sleep(2.2)
+        return {"status": "completed", "engine": "fake", "variants": legal_variants(1), "error": None, "latency_ms": 1, "input_tokens": 3, "output_tokens": 5}
+
+    monkeypatch.setattr("backend.agent.generate", slow_generate)
+    monkeypatch.setattr("backend.orchestrator.generate_agent", slow_generate)
+    with client_for(tmp_path, monkeypatch) as client:
+        provider = client.post("/api/providers", json={"name": "test", "base_url": "http://model.local/v1", "model": "test", "env_name": "ANIMA_TEST_KEY"}).json()
+        created = client.post("/api/runs", json={"intent": "雨夜女孩", "provider_id": provider["id"], "model": "test"}).json()
+        claimed = run_store.claim_next("owner-a")
+        task = asyncio.create_task(worker.execute_run(claimed, "owner-a"))
+        await asyncio.sleep(1.3)
+        stolen = run_store.claim_next("owner-b")
+        assert stolen == {}
+        await task
+        status = client.get(f"/api/runs/{created['run_id']}").json()
+        assert status["status"] == "completed"
+        assert status["usage"]["input_tokens"] == 3
+
+
+def test_claim_run_does_not_steal_running(tmp_path, monkeypatch):
+    with client_for(tmp_path, monkeypatch) as client:
+        created = client.post("/api/runs", json={"intent": "雨夜女孩"}).json()
+        first = run_store.claim_next("owner-a")
+        assert first["id"] == created["run_id"]
+        assert run_store.claim_run(created["run_id"], "sync-owner") == {}
+
+
+def test_restore_document_tokens_match_saved_payload(tmp_path, monkeypatch):
+    with client_for(tmp_path, monkeypatch) as client:
+        created = client.post("/api/documents", json={
+            "title": "base",
+            "intent": "雨夜",
+            "positive_tokens": [{"raw_text": "<lora:rain:0.8>", "locked": True}, *[{"raw_text": item} for item in SIMPLE_TOKENS[1:]]],
+        }).json()
+        fetched = client.get(f"/api/documents/{created['id']}").json()
+        assert fetched["positive_tokens"][0]["locked"] is True
+        assert fetched["positive_tokens"][0]["raw_text"] == "<lora:rain:0.8>"

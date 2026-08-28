@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,16 +15,18 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from .agent import generate as generate_agent, parse_generation_request
+from .agent import AGENT_TIMEOUT_SECONDS, generate as generate_agent, parse_generation_request
+from .conversations import delete_conversation, get_conversation, list_conversation_runs, list_conversations, patch_conversation
 from .db import DB_PATH, SCHEMA_VERSION, connect, init_db, now, row_json
-from .documents import canonical_document, document_view as _document_view, export_document as _export_document, json_value as _json, snapshot as _snapshot, validate_document, write_document as _write_document
+from .documents import canonical_document, document_view as _document_view, export_document as _export_document, json_value as _json, lint_variant_card, snapshot as _snapshot, validate_document, write_document as _write_document
 from .secrets import delete_secret, get_secret, put_secret
 from . import skill_runtime
 from .skill_runtime import strip_explicit_markers
-from .skills import build_skill_state, catalog as skill_catalog, discovery_diagnostics
-from .run_store import ACTIVE, TERMINAL, append_event, cancel_run as cancel_stored_run, create_run, decode_run, get_run, list_events
+from .skills import catalog as skill_catalog, discovery_diagnostics, explain_activation
+from .run_store import TERMINAL, cancel_run as cancel_stored_run, claim_run, create_run, get_run, list_events, owner_id
 
 ROOT = Path(__file__).resolve().parent.parent
+PRODUCT_VERSION = "7.0.0"
 
 
 @asynccontextmanager
@@ -31,7 +35,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Anima Agent Prompt Studio", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Anima Agent Prompt Studio", version=PRODUCT_VERSION, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"https?://(127\.0\.0\.1|localhost)(:\d+)?",
@@ -66,6 +70,8 @@ class DocumentIn(BaseModel):
     protected_tokens: list[str] = Field(default_factory=list)
     notes: str = ""
     source_run_id: str = ""
+    conversation_id: str = ""
+    variant_index: int = 0
 
     @field_validator("title")
     @classmethod
@@ -128,6 +134,21 @@ class ProviderImportIn(BaseModel):
 
 class SkillToggleIn(BaseModel):
     enabled: bool
+
+
+class ConversationPatchIn(BaseModel):
+    title: str | None = None
+    pinned: bool | None = None
+
+    @field_validator("title")
+    @classmethod
+    def title_trim(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        value = value.strip()
+        if not value:
+            raise ValueError("title cannot be empty")
+        return value[:80]
 
 
 def _provider_secret(row: Any) -> str:
@@ -226,7 +247,8 @@ def status() -> dict[str, Any]:
         provider = db.execute("SELECT COUNT(*) FROM providers WHERE enabled=1").fetchone()[0]
         queued = db.execute("SELECT COUNT(*) FROM agent_runs WHERE status='queued'").fetchone()[0]
         running = db.execute("SELECT COUNT(*) FROM agent_runs WHERE status='running'").fetchone()[0]
-    return {"ok": True, "name": app.title, "version": app.version, "schema_version": SCHEMA_VERSION, "documents": documents, "enabled_providers": provider, "queued_runs": queued, "running_runs": running, "database": str(DB_PATH)}
+        conversations = db.execute("SELECT COUNT(*) FROM conversations WHERE archived_at=''").fetchone()[0]
+    return {"ok": True, "name": app.title, "product": "Prompt Workbench", "version": app.version, "schema_version": SCHEMA_VERSION, "documents": documents, "enabled_providers": provider, "queued_runs": queued, "running_runs": running, "conversations": conversations, "database": str(DB_PATH)}
 
 
 @app.get("/api/settings")
@@ -249,8 +271,12 @@ def put_setting(key: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.get("/api/skills")
-def skills() -> dict[str, Any]:
+def skills(intent: str = "") -> dict[str, Any]:
     runtime = _runtime_settings()
+    if intent.strip():
+        explained = explain_activation(intent.strip(), runtime.get("skills") or {})
+        items = [{**item, "source": "codex"} for item in explained["items"]]
+        return {"items": items, "selected_skill_ids": explained["selected_skill_ids"], "diagnostics": explained["diagnostics"]}
     items = [{**item, "source": "codex"} for item in skill_catalog(runtime.get("skills"))]
     return {"items": items, "diagnostics": discovery_diagnostics()}
 
@@ -386,6 +412,11 @@ def _prepare_run_body(body: GenerateIn) -> tuple[GenerateIn, str, str, int]:
     if not body.model:
         runtime_model = runtime.get("model") if provider_id and provider_id == runtime.get("provider_id") else ""
         body = body.model_copy(update={"model": str(runtime_model or (provider["model"] if provider else ""))})
+    fallback_count = len((body.current_document or {}).get("variants", [])) if body.mode == "modify" else 1
+    parse_intent = (body.current_document or {}).get("modification_request", "") if body.mode == "modify" else body.intent
+    parsed_request = parse_generation_request(parse_intent or body.intent, fallback_count=fallback_count)
+    if parsed_request["explicit_count"]:
+        body = body.model_copy(update={"requested_count": parsed_request["requested_count"]})
     conversation_id = body.conversation_id or str(uuid.uuid4())
     with connect() as db:
         latest = db.execute("SELECT COALESCE(MAX(revision),0) AS revision FROM agent_runs WHERE conversation_id=?", (conversation_id,)).fetchone()["revision"]
@@ -444,63 +475,88 @@ async def retry_agent_run(run_id: str) -> dict[str, Any]:
     return {"run_id": run["id"], "id": run["id"], "status": run["status"], "conversation_id": run["conversation_id"], "revision": run["revision"], "parent_run_id": run_id}
 
 
+def _generate_view(stored: dict[str, Any]) -> dict[str, Any]:
+    request = stored.get("request") if isinstance(stored.get("request"), dict) else {}
+    response = stored.get("response") if isinstance(stored.get("response"), dict) else {}
+    usage = stored.get("usage") if isinstance(stored.get("usage"), dict) else {}
+    if not usage:
+        usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    return {
+        "id": stored.get("id") or response.get("id") or "",
+        "status": stored.get("status") or response.get("status") or "failed",
+        "engine": stored.get("engine") or response.get("engine") or "",
+        "provider_id": response.get("provider_id") or request.get("provider_id") or "",
+        "model": response.get("model") or request.get("model") or "",
+        "reasoning_effort": response.get("reasoning_effort") or request.get("reasoning_effort") or "none",
+        "variants": response.get("variants") or [],
+        "error": stored.get("error") or response.get("error"),
+        "selected_skill_ids": response.get("selected_skill_ids")
+            or (request.get("current_document") or {}).get("_explicit_skill_ids")
+            or [],
+        "skill_diagnostics": response.get("skill_diagnostics") or discovery_diagnostics(),
+        "variant_diagnostics": response.get("variant_diagnostics") or [],
+        "tool_trace": response.get("tool_trace") or [],
+        "usage": {
+            "latency_ms": usage.get("latency_ms", stored.get("latency_ms") or response.get("latency_ms")),
+            "input_tokens": usage.get("input_tokens", response.get("input_tokens")),
+            "output_tokens": usage.get("output_tokens", response.get("output_tokens")),
+        },
+        "conversation_id": stored.get("conversation_id") or response.get("conversation_id") or "",
+        "parent_run_id": stored.get("parent_run_id") or response.get("parent_run_id") or "",
+        "revision": stored.get("revision") or response.get("revision") or 1,
+        "mode": stored.get("mode") or response.get("mode") or "create",
+    }
+
+
+async def _wait_run_terminal(run_id: str, owner: str) -> dict[str, Any]:
+    from .worker import execute_run
+    deadline = time.perf_counter() + AGENT_TIMEOUT_SECONDS
+    while time.perf_counter() < deadline:
+        row = get_run(run_id)
+        status = row.get("status")
+        if status in TERMINAL:
+            return row
+        if status == "queued":
+            claimed = claim_run(run_id, owner, lease_seconds=AGENT_TIMEOUT_SECONDS)
+            if claimed:
+                await execute_run(claimed, owner=owner)
+                return get_run(run_id)
+        await asyncio.sleep(0.25)
+    return get_run(run_id)
+
+
 @app.post("/api/generate")
 async def generate(body: GenerateIn) -> dict[str, Any]:
-    runtime = _runtime_settings()
-    activation = skill_runtime.activate(body.intent, runtime.get("skills") or {})
-    request_intent = strip_explicit_markers(body.intent)
-    original_intent = request_intent
-    parent_run = None
-    current_document = dict(body.current_document or {})
-    current_document["_explicit_skill_ids"] = activation["selected_skill_ids"]
-    if body.mode == "modify":
-        if not body.conversation_id or not body.parent_run_id:
-            raise HTTPException(400, "修改当前对话需要 conversation_id 和 parent_run_id")
-        with connect() as db:
-            parent_run = db.execute("SELECT * FROM agent_runs WHERE id=? AND conversation_id=?", (body.parent_run_id, body.conversation_id)).fetchone()
-        if not parent_run:
-            raise HTTPException(400, "当前对话版本不存在，请刷新后重试")
-        original_intent = parent_run["intent"]
-        current_document.setdefault("original_intent", original_intent)
-        current_document["modification_request"] = request_intent
-        body = body.model_copy(update={"intent": original_intent, "current_document": current_document})
-    else:
-        body = body.model_copy(update={"intent": request_intent, "current_document": current_document})
-    provider_id = body.provider_id or str(runtime.get("provider_id") or "")
-    provider = _provider(provider_id)
-    if provider_id and not provider:
-        raise HTTPException(400, "所选供应商不存在或已停用")
-    if not body.model:
-        runtime_model = runtime.get("model") if provider_id and provider_id == runtime.get("provider_id") else ""
-        body.model = str(runtime_model or (provider["model"] if provider else ""))
-    fallback_count = len((body.current_document or {}).get("variants", [])) if body.mode == "modify" else 1
-    parse_intent = (body.current_document or {}).get("modification_request", "") if body.mode == "modify" else body.intent
-    parsed_request = parse_generation_request(parse_intent or body.intent, fallback_count=fallback_count)
-    if parsed_request["explicit_count"]:
-        body = body.model_copy(update={"requested_count": parsed_request["requested_count"]})
-    skill_intent = f"{body.intent} {parse_intent}".strip() if body.mode == "modify" else body.intent
-    capability_state = build_skill_state(
-        skill_intent,
-        runtime.get("skills") or {},
-        parsed_request=parsed_request,
-        explicit_skill_ids=activation["selected_skill_ids"],
-    )
-    result = await generate_agent(body, provider, _provider_secret(provider), str(runtime.get("system_prompt") or ""), capability_state)
+    from .worker import execute_run
+    body, original_intent, conversation_id, revision = _prepare_run_body(body)
     run_id = str(uuid.uuid4())
-    conversation_id = body.conversation_id or run_id
-    with connect() as db:
-        latest_revision = db.execute("SELECT COALESCE(MAX(revision), 0) AS revision FROM agent_runs WHERE conversation_id=?", (conversation_id,)).fetchone()["revision"]
-    revision = int(latest_revision) + 1
-    tool_trace = result.get("tool_trace") or []
-    response = {"id": run_id, "status": result["status"], "engine": result["engine"], "provider_id": provider["id"] if provider else "", "model": body.model, "reasoning_effort": body.reasoning_effort, "variants": result["variants"], "error": result.get("error"), "selected_skill_ids": result.get("selected_skill_ids") or capability_state["__selected_skill_ids"], "skill_diagnostics": discovery_diagnostics(), "variant_diagnostics": result.get("variant_diagnostics", []), "tool_trace": tool_trace, "usage": {"latency_ms": result.get("latency_ms"), "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens")}, "conversation_id": conversation_id, "parent_run_id": body.parent_run_id, "revision": revision, "mode": body.mode}
-    with connect() as db:
-        db.execute("INSERT INTO agent_runs (id,intent,request_json,response_json,status,error_json,engine,latency_ms,created_at,conversation_id,parent_run_id,revision,mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (run_id, original_intent, body.model_dump_json(), json.dumps(response, ensure_ascii=False), result["status"], json.dumps(result.get("error") or {}, ensure_ascii=False), result["engine"], result.get("latency_ms"), now(), conversation_id, body.parent_run_id, revision, body.mode))
-        for sequence, event in enumerate(tool_trace, 1):
-            db.execute(
-                "INSERT INTO agent_events (id,run_id,sequence,event_type,tool_name,arguments_json,result_json,status,latency_ms,error_json,created_at,step_id,attempt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), run_id, sequence, str(event.get("event_type") or ""), str(event.get("tool_name") or ""), json.dumps(event.get("arguments") or {}, ensure_ascii=False), json.dumps(event.get("result") or {}, ensure_ascii=False), str(event.get("status") or ""), event.get("latency_ms"), json.dumps(event.get("error") or {}, ensure_ascii=False), now(), str(event.get("step_id") or event.get("stage") or ""), int(event.get("attempt") or 0)),
-            )
-    return response
+    if not body.conversation_id:
+        conversation_id = run_id
+        with connect() as db:
+            latest = db.execute("SELECT COALESCE(MAX(revision),0) AS revision FROM agent_runs WHERE conversation_id=?", (conversation_id,)).fetchone()["revision"]
+        revision = int(latest) + 1
+    owner = f"sync:{owner_id()}"
+    try:
+        run = create_run(
+            run_id=run_id,
+            request=body.model_dump(),
+            intent=original_intent,
+            conversation_id=conversation_id,
+            parent_run_id=body.parent_run_id,
+            revision=revision,
+            mode=body.mode,
+            idempotency_key=body.idempotency_key.strip()[:200],
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    claimed = claim_run(run["id"], owner, lease_seconds=AGENT_TIMEOUT_SECONDS)
+    if claimed:
+        await execute_run(claimed, owner=owner)
+    else:
+        stored = await _wait_run_terminal(run["id"], owner)
+        if stored.get("status") not in TERMINAL:
+            raise HTTPException(504, {"code": "run_wait_timeout", "run_id": run["id"], "status": stored.get("status"), "stage": stored.get("stage")})
+    return _generate_view(get_run(run["id"]))
 
 
 @app.get("/api/agent-runs")
@@ -525,14 +581,53 @@ def agent_run_trace(run_id: str) -> dict[str, Any]:
     return {"run_id": run_id, "items": [{**row_json(row), "stage": row["step_id"] or "", "arguments": _json(row["arguments_json"], {}), "result": _json(row["result_json"], {}), "error": _json(row["error_json"], {})} for row in rows]}
 
 
+@app.get("/api/conversations")
+def conversations(q: str = "", limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0)) -> dict[str, Any]:
+    return list_conversations(q=q, limit=limit, offset=offset)
+
+
+@app.get("/api/conversations/{conversation_id}")
+def conversation_detail(conversation_id: str) -> dict[str, Any]:
+    item = get_conversation(conversation_id)
+    if not item:
+        raise HTTPException(404, "conversation not found")
+    return item
+
+
+@app.get("/api/conversations/{conversation_id}/runs")
+def conversation_runs(conversation_id: str) -> dict[str, Any]:
+    payload = list_conversation_runs(conversation_id)
+    if not payload:
+        raise HTTPException(404, "conversation not found")
+    return payload
+
+
+@app.patch("/api/conversations/{conversation_id}")
+def conversation_patch(conversation_id: str, body: ConversationPatchIn) -> dict[str, Any]:
+    if body.title is None and body.pinned is None:
+        raise HTTPException(400, "title or pinned is required")
+    item = patch_conversation(conversation_id, title=body.title, pinned=body.pinned)
+    if not item:
+        raise HTTPException(404, "conversation not found")
+    return item
+
+
+@app.delete("/api/conversations/{conversation_id}")
+def conversation_delete(conversation_id: str) -> dict[str, bool]:
+    if not delete_conversation(conversation_id):
+        raise HTTPException(404, "conversation not found")
+    return {"deleted": True}
+
+
 @app.get("/api/workspace")
-def workspace(limit: int = Query(20, ge=1, le=50)) -> dict[str, Any]:
+def workspace(limit: int = Query(20, ge=1, le=100)) -> dict[str, Any]:
     return {
         "status": status(),
         "runtime": _runtime_settings(),
         "providers": providers()["items"],
         "skills": skills()["items"],
         "recent_runs": agent_runs(limit)["items"],
+        "conversations": list_conversations(limit=limit, offset=0),
     }
 
 
@@ -551,9 +646,28 @@ def create_document(body: DocumentIn) -> dict[str, Any]:
         raise HTTPException(422, {"code": "invalid_document", "issues": issues})
     document_id, stamp = str(uuid.uuid4()), now()
     with connect() as db:
-        db.execute("INSERT INTO prompt_documents VALUES(?,?,?,?,?,?,?,?,?,?)", (document_id, document["title"], document["intent"], json.dumps(document["positive_tokens"], ensure_ascii=False), json.dumps(document["negative_tokens"], ensure_ascii=False), json.dumps(document["protected_tokens"], ensure_ascii=False), document["notes"], document["source_run_id"], stamp, stamp))
+        db.execute(
+            "INSERT INTO prompt_documents (id, title, intent, positive_tokens, negative_tokens, protected_tokens, notes, source_run_id, created_at, updated_at, conversation_id, variant_index) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                document_id,
+                document["title"],
+                document["intent"],
+                json.dumps(document["positive_tokens"], ensure_ascii=False),
+                json.dumps(document["negative_tokens"], ensure_ascii=False),
+                json.dumps(document["protected_tokens"], ensure_ascii=False),
+                document["notes"],
+                document["source_run_id"],
+                stamp,
+                stamp,
+                document.get("conversation_id") or "",
+                int(document.get("variant_index") or 0),
+            ),
+        )
         snapshot = _snapshot(document)
-        db.execute("INSERT INTO prompt_versions VALUES(?,?,?,?,?)", (str(uuid.uuid4()), document_id, json.dumps(snapshot, ensure_ascii=False), "create", stamp))
+        db.execute(
+            "INSERT INTO prompt_versions (id, prompt_id, snapshot_json, reason, created_at) VALUES (?,?,?,?,?)",
+            (str(uuid.uuid4()), document_id, json.dumps(snapshot, ensure_ascii=False), "create", stamp),
+        )
         return {"id": document_id, **_document_view(db.execute("SELECT * FROM prompt_documents WHERE id=?", (document_id,)).fetchone())}
 
 
@@ -593,6 +707,21 @@ def restore_document(document_id: str, body: dict[str, Any]) -> dict[str, Any]:
             raise HTTPException(404, "document version not found")
         document = canonical_document(_json(version["snapshot_json"], {}))
         return _write_document(db, document_id, document, "restore")
+
+
+@app.delete("/api/documents/{document_id}")
+def delete_document(document_id: str) -> dict[str, bool]:
+    with connect() as db:
+        row = db.execute("SELECT id FROM prompt_documents WHERE id=?", (document_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "document not found")
+        db.execute("DELETE FROM prompt_documents WHERE id=?", (document_id,))
+    return {"deleted": True}
+
+
+@app.post("/api/documents/lint")
+def lint_document(body: dict[str, Any]) -> dict[str, Any]:
+    return lint_variant_card(body, enforce_quantity=bool(body.get("enforce_quantity")))
 
 
 @app.post("/api/documents/{document_id}/validate")

@@ -141,6 +141,8 @@ def canonical_document(value: Any, *, source_run_id: str = "") -> dict[str, Any]
         "protected_tokens": protected_tokens(positive + negative, raw.get("protected_tokens")),
         "notes": str(raw.get("notes") or "").strip(),
         "source_run_id": str(raw.get("source_run_id") or source_run_id),
+        "conversation_id": str(raw.get("conversation_id") or ""),
+        "variant_index": int(raw.get("variant_index") or 0),
     }
 
 
@@ -189,6 +191,34 @@ def validate_document(document: dict[str, Any], *, enforce_quantity: bool = Fals
     return issues
 
 
+def lint_variant_card(document: dict[str, Any], *, enforce_quantity: bool = False) -> dict[str, Any]:
+    canonical = canonical_document(document)
+    issues = validate_document(canonical, enforce_quantity=enforce_quantity)
+    for issue in issues:
+        issue.setdefault("severity", "error")
+        if issue.get("code") == "quantity_out_of_range" and not enforce_quantity:
+            issue["severity"] = "warning"
+    if not enforce_quantity:
+        extra = validate_document(canonical, enforce_quantity=True)
+        for issue in extra:
+            if issue.get("code") != "quantity_out_of_range":
+                continue
+            if any(item.get("code") == "quantity_out_of_range" for item in issues):
+                continue
+            issue["severity"] = "warning"
+            issues.append(issue)
+    band = _count_band(canonical)
+    return {
+        "issues": issues,
+        "band": None if not band else {
+            "label": band[0],
+            "minimum": band[1],
+            "maximum": band[2],
+            "actual": len(canonical.get("positive_tokens") or []),
+        },
+    }
+
+
 def document_view(row: Any) -> dict[str, Any]:
     item = row_json(row)
     item["positive_tokens"] = json_value(item.pop("positive_tokens", "[]"), [])
@@ -198,7 +228,7 @@ def document_view(row: Any) -> dict[str, Any]:
 
 
 def snapshot(document: dict[str, Any]) -> dict[str, Any]:
-    return {key: document.get(key) for key in ("title", "intent", "positive_tokens", "negative_tokens", "protected_tokens", "notes", "source_run_id")}
+    return {key: document.get(key) for key in ("title", "intent", "positive_tokens", "negative_tokens", "protected_tokens", "notes", "source_run_id", "conversation_id", "variant_index")}
 
 
 def write_document(db: Any, document_id: str, document: dict[str, Any], reason: str) -> dict[str, Any]:
@@ -207,7 +237,22 @@ def write_document(db: Any, document_id: str, document: dict[str, Any], reason: 
         raise HTTPException(404, "document not found")
     db.execute("INSERT INTO prompt_versions(id,prompt_id,snapshot_json,reason,created_at) VALUES(?,?,?,?,?)", (str(uuid.uuid4()), document_id, json.dumps(snapshot(document_view(existing)), ensure_ascii=False), reason, now()))
     stamp = now()
-    db.execute("UPDATE prompt_documents SET title=?,intent=?,positive_tokens=?,negative_tokens=?,protected_tokens=?,notes=?,source_run_id=?,updated_at=? WHERE id=?", (document["title"], document["intent"], json.dumps(document["positive_tokens"], ensure_ascii=False), json.dumps(document["negative_tokens"], ensure_ascii=False), json.dumps(document["protected_tokens"], ensure_ascii=False), document["notes"], document["source_run_id"], stamp, document_id))
+    db.execute(
+        "UPDATE prompt_documents SET title=?,intent=?,positive_tokens=?,negative_tokens=?,protected_tokens=?,notes=?,source_run_id=?,updated_at=?,conversation_id=?,variant_index=? WHERE id=?",
+        (
+            document["title"],
+            document["intent"],
+            json.dumps(document["positive_tokens"], ensure_ascii=False),
+            json.dumps(document["negative_tokens"], ensure_ascii=False),
+            json.dumps(document["protected_tokens"], ensure_ascii=False),
+            document["notes"],
+            document["source_run_id"],
+            stamp,
+            document.get("conversation_id") or "",
+            int(document.get("variant_index") or 0),
+            document_id,
+        ),
+    )
     return document_view(db.execute("SELECT * FROM prompt_documents WHERE id=?", (document_id,)).fetchone())
 
 

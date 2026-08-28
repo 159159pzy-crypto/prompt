@@ -4,7 +4,7 @@ import json
 import time
 from typing import Any, Callable
 
-from .agent import generate as generate_agent, parse_generation_request, validate_variant
+from .agent import ValidationFailed, generate as generate_agent, parse_generation_request, validate_variant
 
 STAGES = ("planner", "generator", "validator", "finalizer")
 
@@ -45,10 +45,16 @@ async def run_pipeline(body: Any, provider: Any, secret: str, system_prompt: str
     emit({"event_type": "stage", "stage": "validator", "step_id": "validator", "status": "running"})
     validated = []
     try:
-        for variant in result.get("variants", []):
-            validated.append(validate_variant(variant, bool(getattr(body, "include_chinese", False))))
+        for index, variant in enumerate(result.get("variants", [])):
+            try:
+                validated.append(validate_variant(variant, bool(getattr(body, "include_chinese", False))))
+            except ValidationFailed as exc:
+                issues = [{**issue, "variant_index": index} for issue in exc.issues]
+                raise ValidationFailed(issues, str(exc)) from exc
     except Exception as exc:
-        emit({"event_type": "stage", "stage": "validator", "step_id": "validator", "status": "failed", "error": {"code": "validator_failed", "message": str(exc)[:500]}})
+        issues = getattr(exc, "issues", None)
+        error_payload = {"code": "validator_failed", "message": str(exc)[:500], **({"issues": issues} if issues else {})}
+        emit({"event_type": "stage", "stage": "validator", "step_id": "validator", "status": "failed", "error": error_payload})
         repaired = await generate_agent(
             body, provider, secret, system_prompt, enabled_skills,
             event_sink=lambda event: emit({**event, "stage": "validator", "step_id": "validator", "attempt": 2}),
@@ -57,10 +63,17 @@ async def run_pipeline(body: Any, provider: Any, secret: str, system_prompt: str
         if repaired.get("status") != "completed":
             return repaired
         try:
-            validated = [validate_variant(item, bool(getattr(body, "include_chinese", False))) for item in repaired.get("variants", [])]
+            validated = []
+            for index, item in enumerate(repaired.get("variants", [])):
+                try:
+                    validated.append(validate_variant(item, bool(getattr(body, "include_chinese", False))))
+                except ValidationFailed as repair_exc:
+                    repair_issues = [{**issue, "variant_index": index} for issue in repair_exc.issues]
+                    raise ValidationFailed(repair_issues, str(repair_exc)) from repair_exc
             result = repaired
         except Exception as repair_exc:
-            return {**repaired, "status": "failed", "variants": [], "error": {"code": "validator_failed", "message": str(repair_exc)[:500]}}
+            repair_issues = getattr(repair_exc, "issues", None)
+            return {**repaired, "status": "failed", "variants": [], "error": {"code": "validator_failed", "message": str(repair_exc)[:500], **({"issues": repair_issues} if repair_issues else {})}}
     emit({"event_type": "stage", "stage": "validator", "step_id": "validator", "status": "completed", "result": {"count": len(validated)}})
 
     if cancel_check and cancel_check():

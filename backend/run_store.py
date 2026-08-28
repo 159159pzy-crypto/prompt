@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .conversations import ensure_conversation, touch_conversation
 from .db import connect, now
 
 TERMINAL = {"completed", "failed", "cancelled"}
@@ -60,6 +61,8 @@ def create_run(*, run_id: str, request: dict[str, Any], intent: str, conversatio
             (run_id, intent, json.dumps(request, ensure_ascii=False), "{}", "queued", "{}", "", None, now(), conversation_id, parent_run_id, revision, mode, "queued", idempotency_key, 0, "", "", "", "", "", 0, 0, "{}"),
         )
         db.commit()
+    ensure_conversation(conversation_id, intent[:80], "intent")
+    with connect() as db:
         return decode_run(db.execute("SELECT * FROM agent_runs WHERE id=?", (run_id,)).fetchone())
 
 
@@ -82,6 +85,25 @@ def claim_next(owner: str | None = None) -> dict[str, Any]:
         )
         db.commit()
         return decode_run(db.execute("SELECT * FROM agent_runs WHERE id=?", (row["id"],)).fetchone())
+
+
+def claim_run(run_id: str, owner: str, lease_seconds: int | None = None) -> dict[str, Any]:
+    lease = int(lease_seconds or LEASE_SECONDS)
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT * FROM agent_runs WHERE id=? AND status='queued'", (run_id,)).fetchone()
+        if not row:
+            db.commit()
+            return {}
+        stamp = now()
+        db.execute(
+            "UPDATE agent_runs SET status='running', stage='planner', attempt=attempt+1, "
+            "lease_owner=?, lease_expires_at=?, heartbeat_at=?, started_at=COALESCE(NULLIF(started_at,''),?) "
+            "WHERE id=? AND status='queued'",
+            (owner, _iso_after(lease), stamp, stamp, run_id),
+        )
+        db.commit()
+        return decode_run(db.execute("SELECT * FROM agent_runs WHERE id=?", (run_id,)).fetchone())
 
 
 def heartbeat(run_id: str, owner: str) -> bool:
@@ -116,6 +138,8 @@ def finish_run(run_id: str, *, status: str, response: dict[str, Any] | None = No
     if status not in TERMINAL:
         raise ValueError(f"invalid terminal status: {status}")
     update_run(run_id, status=status, stage="completed" if status == "completed" else ("cancelled" if status == "cancelled" else "failed"), response_json=json.dumps(response or {}, ensure_ascii=False), error_json=json.dumps(error or {}, ensure_ascii=False), usage_json=json.dumps(usage or {}, ensure_ascii=False), latency_ms=latency_ms, finished_at=now(), lease_owner="", lease_expires_at="")
+    run = get_run(run_id)
+    touch_conversation(str(run.get("conversation_id") or ""))
 
 
 def cancel_run(run_id: str) -> dict[str, Any]:

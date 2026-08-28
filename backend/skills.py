@@ -168,6 +168,46 @@ def instructions(value: Any) -> list[str]:
     return [item["instruction"] for item in selected(value)]
 
 
+def explain_activation(
+    intent: str,
+    enabled: Any = None,
+    *,
+    parsed_request: dict[str, Any] | None = None,
+    explicit_skill_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Label why each catalog skill is selected, using the same state as generate."""
+    from .agent import parse_generation_request
+
+    parsed = parsed_request or parse_generation_request(intent)
+    state = build_skill_state(intent, enabled, parsed_request=parsed, explicit_skill_ids=explicit_skill_ids)
+    selected_set = set(state.get("__selected_skill_ids") or [])
+    explicit = {str(item).casefold() for item in (state.get("__explicit_skill_ids") or [])}
+    explicit.update(skill_runtime.explicit_names(intent))
+    dimensions = {str(item) for item in (state.get("__variation_dimensions") or [])}
+    enabled_map = normalize_enabled(state)
+    items = []
+    for item in catalog(state):
+        skill_id = item["id"]
+        definition = next((row for row in definitions() if row["id"] == skill_id), None)
+        matched = skill_runtime.matching_triggers(definition["skill"], intent) if definition else []
+        if skill_id in CORE_SKILL_IDS:
+            reason = "core"
+        elif not enabled_map.get(skill_id, True) and skill_id not in CORE_SKILL_IDS and skill_id not in selected_set:
+            reason = "disabled"
+        elif skill_id in dimensions:
+            reason = "dimension"
+        elif matched:
+            reason = "trigger"
+        elif skill_id.casefold() in explicit:
+            reason = "explicit"
+        elif skill_id in selected_set:
+            reason = "dependency"
+        else:
+            reason = ""
+        items.append({**item, "selection_reason": reason, "matched_triggers": matched, "selected": skill_id in selected_set})
+    return {"items": items, "selected_skill_ids": list(state.get("__selected_skill_ids") or []), "diagnostics": discovery_diagnostics()}
+
+
 def build_skill_state(
     intent: str,
     enabled: Any = None,

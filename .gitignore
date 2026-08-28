@@ -6,3 +6,5 @@ __pycache__/
 output/
 .playwright-cli/
 rollback-v2-*/
+launcher/bin/
+launcher/obj/

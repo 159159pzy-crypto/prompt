@@ -149,6 +149,14 @@ class ModelResponseError(ValueError):
         self.code = code
 
 
+class ValidationFailed(ValueError):
+    """Deterministic variant validation failed with structured issues."""
+
+    def __init__(self, issues: list[dict[str, Any]], message: str = "") -> None:
+        self.issues = list(issues)
+        super().__init__(message or "; ".join(str(item.get("message") or "") for item in self.issues))
+
+
 def _token_list(value: Any, field: str) -> list[Any]:
     """Accept common model shorthand, then canonicalize it into Token objects."""
     if value is None:
@@ -356,7 +364,7 @@ def validate_variant(raw: dict[str, Any], include_chinese: bool) -> dict[str, An
     document = normalized
     issues = _tool_validate_prompt({"document": document, "enforce_quantity": True})["issues"]
     if issues:
-        raise ValueError("; ".join(issue["message"] for issue in issues))
+        raise ValidationFailed(issues)
     if include_chinese:
         translations = raw.get("translations") or {}
         if not isinstance(translations, dict):
@@ -552,7 +560,11 @@ async def generate(body: Any, provider: Any, secret: str, system_prompt: str = "
                         raise ModelResponseError("provider_schema_invalid", "模型没有返回有效候选。")
                     diagnostics = _cross_variant_diagnostics(variants, variation_dimensions) if requested_count > 1 else []
                     if diagnostics:
-                        raise ModelResponseError("variant_too_similar", "; ".join(item["code"] + " variants " + str(item["variants"]) for item in diagnostics))
+                        if round_index + 1 < MAX_AGENT_ROUNDS:
+                            raise ModelResponseError("variant_too_similar", "; ".join(item["code"] + " variants " + str(item["variants"]) for item in diagnostics))
+                        input_tokens, output_tokens = _usage_tokens(last_usage)
+                        emit({"event_type": "final", "round": round_index + 1, "status": "completed"})
+                        return {"status": "completed", "engine": "openai-compatible", "variants": variants, "error": None, "latency_ms": int((time.perf_counter() - started) * 1000), "input_tokens": input_tokens, "output_tokens": output_tokens, "tool_trace": trace, "selected_skill_ids": actual_skill_ids, "variant_diagnostics": diagnostics}
                 except (ModelResponseError, KeyError, TypeError, ValueError) as exc:
                     retry_note = f"Return exactly {requested_count} complete variants in one JSON object. Follow the required schema, quantity band, and keep variant overlap below {VARIANT_OVERLAP_LIMIT}."
                     messages.extend([
